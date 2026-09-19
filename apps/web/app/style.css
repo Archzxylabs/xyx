@@ -1,0 +1,10 @@
+*{box-sizing:border-box}
+html{background:#0b1611;color:#ecf4e9}
+body{margin:0;background:radial-gradient(circle at 80% 0%,#1b3524 0%,#0b1611 43%);color:#ecf4e9;font:15px/1.6 Arial,Helvetica,sans-serif;min-height:100vh}
+a{color:inherit;text-decoration:none}
+a:hover{color:#bcfa73}
+.muted{color:#9fb2a3}
+.mono,code{font:12px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}
+.eyebrow{font:11px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.14em;color:#a8bdab}
+::selection{background:#bcfa73;color:#0b1611}
+:focus-visible{outline:2px solid #bcfa73;outline-offset:4px}
