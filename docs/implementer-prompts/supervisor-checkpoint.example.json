@@ -1,0 +1,63 @@
+{
+  "schema": "xyx.implementer-checkpoint.v1",
+  "stage": "IMPLEMENTER_06",
+  "round": 1,
+  "baselineSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "headSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "task": {
+    "id": "provider-runner-remediation",
+    "title": "Repair provider runner evidence boundaries"
+  },
+  "ownership": {
+    "allowedPaths": [
+      "packages/monad/src/provider-runner/runner.ts",
+      "packages/monad/src/provider-runner/adapters.ts",
+      "packages/monad/src/provider-runner/index.ts",
+      "packages/monad/test/provider-runner.test.ts",
+      "packages/monad/test/provider-runner-settle.test.ts",
+      "packages/monad/test/provider-runner-privacy.test.ts",
+      "packages/monad/test/provider-runner-dual-rpc.test.ts"
+    ],
+    "filesChanged": [
+      "packages/monad/src/provider-runner/runner.ts",
+      "packages/monad/test/provider-runner-settle.test.ts"
+    ]
+  },
+  "observed": {
+    "gates": {
+      "targeted": "PASS",
+      "node": "PASS",
+      "typecheck": "PASS",
+      "contracts": "PASS",
+      "web": "PASS",
+      "diffCheck": "PASS"
+    },
+    "checks": {
+      "recoveryEvidence": "PASS",
+      "errorPrivacy": "PASS",
+      "preflightSideEffects": "PASS",
+      "pendingReconciliation": "PASS",
+      "testQuality": "PASS"
+    },
+    "changeSummary": [
+      "Recovery reconstructs public transfer facts from two finalized reader observations.",
+      "Public failures use stable runner-authored codes and bounded messages.",
+      "Token mismatch is rejected before injected work or transaction hooks run.",
+      "A known pending broadcast hash remains available for reconciliation."
+    ],
+    "testEvidence": [
+      "Fabricated recovery fields cannot produce a finalized result.",
+      "Sensitive marker tests find no marker in serialized public output.",
+      "Token mismatch leaves every side-effect spy at zero calls.",
+      "Pending known-hash tests retain the hash without claiming finality."
+    ],
+    "claims": [
+      "All four remediation classes pass fresh local regression tests.",
+      "No public network action was attempted or observed."
+    ],
+    "unresolvedRisks": [
+      "Independent adversarial review has not started."
+    ]
+  },
+  "proposedNextStep": "Begin the test-only reviewer stage after supervisor and human checkpoint review."
+}

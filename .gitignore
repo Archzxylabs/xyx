@@ -1,4 +1,5 @@
 node_modules/
+.xyx-data/
 .env
 .env.*
 .envo

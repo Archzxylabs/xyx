@@ -5,3 +5,5 @@ Read `docs/XYX_MONAD_PRD.md` before changing product behavior. This repository t
 Never claim a testnet action happened from fixtures, a local test, or a prepared transaction. The `/demo` page must show an empty or unverified state until real receipts and contract state are observed. Keep buyer, provider, evaluator, and relayer keys separate and out of Git.
 
 The contracts are Solidity/Foundry. Run `npm run test:contracts`, `npm test`, `npm run typecheck`, and `npm run build:web` after relevant changes. The Next.js instructions in `apps/web/AGENTS.md` also apply to the web app.
+
+For multi-agent task ownership, report evidence, real-only Jev triage, and the boundary between Codex, Claude, Jev, and human authorization, read `docs/XYX_AGENT_WORKFLOW.md` before starting implementation work.

@@ -1,3 +1,16 @@
+/**
+ * LEGACY MODULE — retired `xyx.payout.v1` payout spec and binding helpers.
+ *
+ * This module is not canonical. It describes the retired AgenticCommerce payout
+ * flow and is reachable only through the legacy namespace:
+ *
+ *   import { legacy } from '@xyx/monad';        // or '@xyx/monad/legacy'
+ *
+ * Canonical modules and new code must not import this file directly. Canonical
+ * delivery terms, commitments, and manifest shape live in `delivery.ts`,
+ * `commitments.ts`, and `manifest.ts`.
+ */
+
 import { decodeEventLog, encodeFunctionData, erc20Abi, type Address, type Hex } from 'viem';
 import { z } from 'zod';
 import { canonicalJSON, hashJSON } from './canonical';

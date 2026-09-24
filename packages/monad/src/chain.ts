@@ -1,26 +1,44 @@
+/**
+ * LEGACY MODULE — retired AgenticCommerce / XYXEvaluator payout reads.
+ *
+ * This module is not canonical. It reads the retired `AgenticCommerce` and
+ * `XYXEvaluator` contracts and the `xyx.payout.v1` spec format. It is reachable
+ * only through the legacy namespace:
+ *
+ *   import { legacy } from '@xyx/monad';        // or '@xyx/monad/legacy'
+ *
+ * Canonical modules and new code must not import this file directly. The
+ * canonical delivery-protocol read path lives in `delivery-chain.ts` and
+ * `protocol.ts`.
+ */
+
 import type { Abi, Address, Hex } from 'viem';
 import commerceArtifact from '../../contracts/out/AgenticCommerce.sol/AgenticCommerce.json' with {type: 'json'};
 import evaluatorArtifact from '../../contracts/out/XYXEvaluator.sol/XYXEvaluator.json' with {type: 'json'};
-import type { PayoutBinding, ReceiptReader } from './payout';
-import { finalizedReceipt } from './payout';
+import type { PayoutBinding } from './payout';
 import type { JobSnapshot } from './payout';
+import {
+  finalizedBlock,
+  matchedFinalizedReceipt,
+  type CanonicalChainReader,
+  type CanonicalFinalizedBlock,
+} from './canonical-chain';
 
 export const commerceAbi = commerceArtifact.abi as Abi;
 export const evaluatorAbi = evaluatorArtifact.abi as Abi;
-export type ChainReader = ReceiptReader & {
-  readContract(args: {address: Address; abi: Abi; functionName: string; args?: readonly unknown[]; blockNumber?: bigint}): Promise<unknown>;
+
+// Retro-compatible aliases: finalizedBlock/matchedFinalizedReceipt are owned by
+// the canonical chain module; this legacy module only re-exports them.
+export { finalizedBlock, matchedFinalizedReceipt };
+export type FinalizedBlock = CanonicalFinalizedBlock;
+export type ChainReader = CanonicalChainReader & {
+  getTransaction(args: {hash: Hex}): Promise<{hash: Hex; from: Address; to: Address | null; input: Hex; blockNumber: bigint | null; blockHash: Hex | null}>;
 };
 
 export type PayoutSnapshot = {
   blockNumber: bigint; blockHash: Hex; timestamp: bigint; job: JobSnapshot; binding: PayoutBinding;
 };
 
-export type FinalizedBlock={number:bigint;hash:Hex;timestamp:bigint};
-export async function finalizedBlock(reader:ReceiptReader):Promise<FinalizedBlock>{
-  const block=await reader.getBlock({blockTag:'finalized'});
-  if(block.number===null || block.hash===null)throw new Error('FINALIZED_SNAPSHOT_UNAVAILABLE');
-  return {number:block.number,hash:block.hash,timestamp:block.timestamp};
-}
 
 export async function readPayoutSnapshotAt(reader: ChainReader, commerce: Address, evaluator: Address, jobId: bigint, provider: Address, transfer: Hex, target:FinalizedBlock): Promise<PayoutSnapshot> {
   const block=await reader.getBlock({blockNumber:target.number});
@@ -59,15 +77,5 @@ export async function matchedPayoutSnapshot(primary:ChainReader,secondary:ChainR
     readPayoutSnapshotAt(primary,commerce,evaluator,jobId,provider,transfer,target),readPayoutSnapshotAt(secondary,commerce,evaluator,jobId,provider,transfer,target),
   ]);
   if(!sameSnapshot(first,second))throw new Error('RPC_STATE_MISMATCH');
-  return first;
-}
-
-export async function matchedFinalizedReceipt(primary:ReceiptReader,secondary:ReceiptReader,hash:Hex){
-  const [first,second]=await Promise.all([finalizedReceipt(primary,hash),finalizedReceipt(secondary,hash)]);
-  const one=JSON.stringify({status:first.receipt.status,to:first.receipt.to,block:first.receipt.blockNumber.toString(),blockHash:first.receipt.blockHash,
-    logs:first.receipt.logs.map(log=>({address:log.address,data:log.data,topics:log.topics}))});
-  const two=JSON.stringify({status:second.receipt.status,to:second.receipt.to,block:second.receipt.blockNumber.toString(),blockHash:second.receipt.blockHash,
-    logs:second.receipt.logs.map(log=>({address:log.address,data:log.data,topics:log.topics}))});
-  if(one!==two)throw new Error('RPC_RECEIPT_MISMATCH');
   return first;
 }
