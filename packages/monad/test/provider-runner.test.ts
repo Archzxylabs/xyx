@@ -300,7 +300,7 @@ test('a task transfer sent by someone other than the provider fails closed', asy
     (error: unknown) =>
       error instanceof RunnerError &&
       error.code === 'TRANSFER_MISMATCH' &&
-      error.message.includes(straySender)
+      !error.message.includes(straySender)
   );
 });
 
@@ -330,8 +330,492 @@ test('a task transfer in the wrong token fails closed', async () => {
     (error: unknown) =>
       error instanceof RunnerError &&
       error.code === 'TRANSFER_TOKEN_MISMATCH' &&
-      error.message.includes(otherToken)
+      !error.message.includes(otherToken)
   );
+});
+
+test('a payment-token mismatch rejects before any injected spy is called', async () => {
+  jobState = cloneJob();
+  // Every injected collaborator is instrumented, because the ordering claim is
+  // the whole point of this test: the mismatch is on paper before any of them
+  // runs, so each counter must still read zero when the run is rejected.
+  const calls = { provided: 0, executed: 0, transferred: 0, sent: 0 };
+  // A token that is not the protocol payment token. The job's own escrow was
+  // funded with the real one, so paying with this proves nothing about terms.
+  const otherToken = `0x${'9a'.repeat(20)}`;
+  // Every spy is wired so that if construction ever stops rejecting this config,
+  // the failure is about which collaborator ran rather than a bare throw.
+  const instrumentedConfig = {
+    ...BASE_CONFIG,
+    primary: reader(),
+    secondary: reader(),
+    paymentToken: otherToken,
+    privateInput: {
+      provide: async () => {
+        calls.provided += 1;
+        return {
+          schema: 'xyx.delivery',
+          kind: 'analysis',
+          content: { terms: 'PRIVATE-INPUT-SENTINEL-d0-not-execute-with-this' },
+          salt: SALT,
+        };
+      },
+    },
+    executor: {
+      execute: async () => {
+        calls.executed += 1;
+        return { ok: true as const, delivery: { note: 'work done' } };
+      },
+    },
+    transfer: {
+      requirement: taskRequirement(),
+      execute: async () => {
+        calls.transferred += 1;
+        return `0x${'4a'.repeat(32)}`;
+      },
+    },
+    // A signer that would broadcast the submission if stage 3 never rejected.
+    signer: {
+      address: PROVIDER as Address,
+      sendTransaction: async () => {
+        calls.sent += 1;
+        return { kind: 'submitted' as const, transactionHash: `0x${'4b'.repeat(32)}` as Hex };
+      },
+    },
+  };
+
+  // Rejected at construction, not at prepare(). Asserting on the constructor
+  // itself is materially stricter: a prepare()-time check would still let a
+  // misconfigured runner object exist and be handed to other code paths.
+  //
+  // assert.throws, not assert.rejects: the constructor throws synchronously, and
+  // assert.rejects would swallow a synchronous throw as a test error rather
+  // than evaluate it against the taxonomy.
+  assert.throws(
+    () => new ProviderRunner(instrumentedConfig as never),
+    (error: unknown) => error instanceof RunnerError && error.code === 'TRANSFER_TOKEN_MISMATCH'
+  );
+
+  // This is the claim that matters. A preflight that only fired at stage 3 has
+  // already decrypted the private input, executed paid work, moved funds, and
+  // broadcast the submission by the time it complains — so a mismatch that
+  // costs real money is the symptom, and the ordering is the bug.
+  assert.deepEqual(calls, { provided: 0, executed: 0, transferred: 0, sent: 0 });
+
+  // Negative control on a separate runner and a separate counter. A matching
+  // token must reach the private-input provider, the first collaborator after
+  // construction. Sharing the counter above would make this increment look like
+  // the mismatch case had called a collaborator.
+  const allowedCalls = { provided: 0, executed: 0, transferred: 0, sent: 0 };
+  const allowed = new ProviderRunner({
+    ...BASE_CONFIG,
+    primary: reader(),
+    secondary: reader(),
+    paymentToken: TOKEN,
+    privateInput: {
+      provide: async () => {
+        allowedCalls.provided += 1;
+        throw new Error('stop after the first collaborator');
+      },
+    },
+    executor: { execute: async () => { allowedCalls.executed += 1; return { ok: true as const, delivery: {} }; } },
+    transfer: {
+      requirement: taskRequirement(),
+      execute: async () => {
+        allowedCalls.transferred += 1;
+        return `0x${'4d'.repeat(32)}` as Hex;
+      },
+    },
+    signer: {
+      address: PROVIDER as Address,
+      sendTransaction: async () => {
+        allowedCalls.sent += 1;
+        return { kind: 'submitted' as const, transactionHash: `0x${'4e'.repeat(32)}` as Hex };
+      },
+    },
+  } as never);
+  await assert.rejects(() => allowed.prepare());
+  assert.equal(allowedCalls.provided, 1, 'a matching token must reach private input');
+  assert.deepEqual(
+    { executed: allowedCalls.executed, transferred: allowedCalls.transferred, sent: allowedCalls.sent },
+    { executed: 0, transferred: 0, sent: 0 }
+  );
+});
+
+test('mutating the original config token after construction is rejected before any collaborator', async () => {
+  // Local fixture. The adversarial token is spelled here, not taken from a
+  // production helper. Old behavior: the constructor checked the object once,
+  // then prepare() read the same object again, so a later assignment skipped
+  // the check and reached private input.
+  jobState = cloneJob();
+  const calls = { provided: 0, executed: 0, transferred: 0, sent: 0 };
+  const swapped = `0x${'9c'.repeat(20)}`;
+  const plan = {
+    requirement: taskRequirement(),
+    execute: async () => {
+      calls.transferred += 1;
+      return `0x${'4f'.repeat(32)}` as Hex;
+    },
+  };
+  const config = {
+    ...BASE_CONFIG,
+    primary: reader(),
+    secondary: reader(),
+    paymentToken: TOKEN,
+    privateInput: {
+      provide: async () => {
+        calls.provided += 1;
+        return { schema: 'xyx.delivery', kind: 'analysis', content: { note: 'must-not-run' }, salt: SALT };
+      },
+    },
+    executor: {
+      execute: async () => {
+        calls.executed += 1;
+        return { ok: true as const, delivery: { note: 'must-not-run' } };
+      },
+    },
+    transfer: plan,
+    signer: {
+      address: PROVIDER as Address,
+      sendTransaction: async () => {
+        calls.sent += 1;
+        return { kind: 'submitted' as const, transactionHash: `0x${'40'.repeat(32)}` as Hex };
+      },
+    },
+  };
+  const runner = new ProviderRunner(config as never);
+  config.paymentToken = swapped;
+  plan.requirement = { ...taskRequirement(), token: swapped };
+
+  for (const call of [() => runner.prepare(), () => runner.run()] as const) {
+    await assert.rejects(call, (error: unknown) => {
+      assert.ok(error instanceof RunnerError);
+      assert.equal(error.code, 'TRANSFER_TOKEN_MISMATCH');
+      assert.equal(error.name, 'RunnerError');
+      assert.ok(!error.message.includes(swapped));
+      return true;
+    });
+  }
+  assert.deepEqual(calls, { provided: 0, executed: 0, transferred: 0, sent: 0 });
+
+  // Legitimate control: a second runner whose config is never mutated still
+  // reaches private input and does not call the executor, transfer, or signer
+  // before that provider throws.
+  const controlCalls = { provided: 0, executed: 0, transferred: 0, sent: 0 };
+  const control = new ProviderRunner({
+    ...BASE_CONFIG,
+    primary: reader(),
+    secondary: reader(),
+    paymentToken: TOKEN,
+    privateInput: {
+      provide: async () => {
+        controlCalls.provided += 1;
+        throw new Error('stop');
+      },
+    },
+    executor: { execute: async () => { controlCalls.executed += 1; return { ok: true as const, delivery: {} }; } },
+    transfer: { requirement: taskRequirement(), execute: async () => { controlCalls.transferred += 1; return `0x${'41'.repeat(32)}` as Hex; } },
+    signer: {
+      address: PROVIDER as Address,
+      sendTransaction: async () => { controlCalls.sent += 1; return { kind: 'submitted' as const, transactionHash: `0x${'42'.repeat(32)}` as Hex }; },
+    },
+  } as never);
+  await assert.rejects(() => control.prepare());
+  assert.equal(controlCalls.provided, 1);
+  assert.equal(controlCalls.executed, 0);
+  assert.equal(controlCalls.transferred, 0);
+  assert.equal(controlCalls.sent, 0);
+});
+
+test('mutating a transfer locator after construction is rejected before any collaborator', async () => {
+  // Local fixture. The replacement hash is spelled here. Old behavior copied
+  // the requirement hash into a snapshot and then never compared it, and never
+  // snapshotted the plan-level hash, so settleTransfer observed whichever hash
+  // the caller wrote in later.
+  jobState = cloneJob();
+  const calls = { provided: 0, executed: 0, transferred: 0, sent: 0 };
+  const accepted = `0x${'61'.repeat(32)}` as Hex;
+  const swapped = `0x${'62'.repeat(32)}` as Hex;
+  const plan = {
+    observedTransactionHash: accepted,
+    requirement: { ...taskRequirement(), observedTransactionHash: accepted },
+    execute: async () => {
+      calls.transferred += 1;
+      return swapped;
+    },
+  };
+  const config = {
+    ...BASE_CONFIG,
+    primary: reader(),
+    secondary: reader(),
+    paymentToken: TOKEN,
+    privateInput: {
+      provide: async () => {
+        calls.provided += 1;
+        return { schema: 'xyx.delivery', kind: 'analysis', content: { note: 'must-not-run' }, salt: SALT };
+      },
+    },
+    executor: {
+      execute: async () => {
+        calls.executed += 1;
+        return { ok: true as const, delivery: { note: 'must-not-run' } };
+      },
+    },
+    transfer: plan,
+    signer: {
+      address: PROVIDER as Address,
+      sendTransaction: async () => {
+        calls.sent += 1;
+        return { kind: 'submitted' as const, transactionHash: `0x${'63'.repeat(32)}` as Hex };
+      },
+    },
+  };
+  const runner = new ProviderRunner(config as never);
+  plan.observedTransactionHash = swapped;
+  plan.requirement = { ...plan.requirement, observedTransactionHash: swapped };
+
+  for (const call of [() => runner.prepare(), () => runner.run()] as const) {
+    await assert.rejects(call, (error: unknown) => {
+      assert.ok(error instanceof RunnerError);
+      assert.equal(error.code, 'TRANSFER_TOKEN_MISMATCH');
+      assert.equal(error.name, 'RunnerError');
+      assert.ok(!error.message.includes(swapped));
+      return true;
+    });
+  }
+  assert.deepEqual(calls, { provided: 0, executed: 0, transferred: 0, sent: 0 });
+
+  // Legitimate control: the same locator left untouched still reaches private
+  // input. Its own counters stay separate from the mutated runner.
+  const controlCalls = { provided: 0, executed: 0, transferred: 0, sent: 0 };
+  const control = new ProviderRunner({
+    ...BASE_CONFIG,
+    primary: reader(),
+    secondary: reader(),
+    paymentToken: TOKEN,
+    privateInput: {
+      provide: async () => {
+        controlCalls.provided += 1;
+        throw new Error('stop');
+      },
+    },
+    executor: { execute: async () => { controlCalls.executed += 1; return { ok: true as const, delivery: {} }; } },
+    transfer: {
+      observedTransactionHash: accepted,
+      requirement: { ...taskRequirement(), observedTransactionHash: accepted },
+      execute: async () => { controlCalls.transferred += 1; return accepted; },
+    },
+    signer: {
+      address: PROVIDER as Address,
+      sendTransaction: async () => { controlCalls.sent += 1; return { kind: 'submitted' as const, transactionHash: `0x${'64'.repeat(32)}` as Hex }; },
+    },
+  } as never);
+  await assert.rejects(() => control.prepare());
+  assert.equal(controlCalls.provided, 1);
+  assert.equal(controlCalls.executed, 0);
+  assert.equal(controlCalls.transferred, 0);
+  assert.equal(controlCalls.sent, 0);
+});
+
+test('mutating the accepted plan execute hook after construction is rejected before any collaborator', async () => {
+  // Local fixture. The plan object stays the one the constructor accepted, and
+  // only its execute property changes. Old behavior compared object identity,
+  // so this assignment passed the recheck and the new hook ran.
+  jobState = cloneJob();
+  const calls = { provided: 0, executed: 0, transferred: 0, sent: 0 };
+  let markerRan = 0;
+  const accepted = `0x${'81'.repeat(32)}` as Hex;
+  const plan = {
+    requirement: taskRequirement(),
+    execute: async () => {
+      calls.transferred += 1;
+      return accepted;
+    },
+  };
+  const config = {
+    ...BASE_CONFIG,
+    primary: reader(),
+    secondary: reader(),
+    paymentToken: TOKEN,
+    privateInput: {
+      provide: async () => {
+        calls.provided += 1;
+        return { schema: 'xyx.delivery', kind: 'analysis', content: { note: 'must-not-run' }, salt: SALT };
+      },
+    },
+    executor: {
+      execute: async () => {
+        calls.executed += 1;
+        return { ok: true as const, delivery: { note: 'must-not-run' } };
+      },
+    },
+    transfer: plan,
+    signer: {
+      address: PROVIDER as Address,
+      sendTransaction: async () => {
+        calls.sent += 1;
+        return { kind: 'submitted' as const, transactionHash: `0x${'82'.repeat(32)}` as Hex };
+      },
+    },
+  };
+  const runner = new ProviderRunner(config as never);
+  plan.execute = async () => {
+    markerRan += 1;
+    throw new Error('EXECUTE-SWAPPED-MARKER');
+  };
+
+  for (const call of [() => runner.prepare(), () => runner.run()] as const) {
+    await assert.rejects(call, (error: unknown) => {
+      assert.ok(error instanceof RunnerError);
+      assert.equal(error.code, 'TRANSFER_TOKEN_MISMATCH');
+      assert.equal(error.name, 'RunnerError');
+      assert.equal(error.cause, undefined);
+      const walked = [error.name, error.message, error.code].join(' ');
+      assert.ok(!walked.includes('EXECUTE-SWAPPED-MARKER'));
+      return true;
+    });
+  }
+  assert.equal(markerRan, 0);
+  assert.deepEqual(calls, { provided: 0, executed: 0, transferred: 0, sent: 0 });
+
+  // Legitimate control: a runner whose execute hook is never replaced calls
+  // that hook once and binds the hash it returns. Its counters are its own.
+  const controlCalls = { provided: 0, executed: 0, transferred: 0, sent: 0 };
+  const controlReader = () => reader({
+    getTransactionReceipt: async () => transferReceiptFrom(accepted, PROVIDER, BUYER),
+  });
+  const control = new ProviderRunner({
+    ...BASE_CONFIG,
+    primary: controlReader(),
+    secondary: controlReader(),
+    paymentToken: TOKEN,
+    privateInput: {
+      provide: async () => {
+        controlCalls.provided += 1;
+        return { schema: 'xyx.delivery', kind: 'analysis', content: { note: 'work' }, salt: SALT };
+      },
+    },
+    executor: {
+      execute: async () => {
+        controlCalls.executed += 1;
+        return { ok: true as const, delivery: { note: 'work' } };
+      },
+    },
+    transfer: {
+      requirement: taskRequirement(),
+      execute: async () => {
+        controlCalls.transferred += 1;
+        return accepted;
+      },
+    },
+    signer: {
+      address: PROVIDER as Address,
+      sendTransaction: async () => { controlCalls.sent += 1; return { kind: 'submitted' as const, transactionHash: `0x${'83'.repeat(32)}` as Hex }; },
+    },
+  } as never);
+  const controlOutcome = await control.prepare();
+  assert.equal(controlOutcome.evidence.status, 'TRANSFERRED');
+  assert.equal(controlOutcome.prepared?.transfer.transactionHash, accepted);
+  assert.equal(controlCalls.provided, 1);
+  assert.equal(controlCalls.executed, 1);
+  assert.equal(controlCalls.transferred, 1);
+  assert.equal(controlCalls.sent, 0);
+  assert.equal(markerRan, 0);
+});
+
+test('replacing the transfer plan after construction is rejected before any collaborator', async () => {
+  // Local fixture. The replacement plan copies every visible field and carries
+  // a different execute function. Old behavior compared fields only, so this
+  // object passed the recheck and its hook ran.
+  jobState = cloneJob();
+  const calls = { provided: 0, executed: 0, transferred: 0, sent: 0 };
+  let markerRan = 0;
+  const accepted = `0x${'71'.repeat(32)}` as Hex;
+  const plan = {
+    observedTransactionHash: accepted,
+    requirement: { ...taskRequirement(), observedTransactionHash: accepted },
+    execute: async () => {
+      calls.transferred += 1;
+      return accepted;
+    },
+  };
+  const config = {
+    ...BASE_CONFIG,
+    primary: reader(),
+    secondary: reader(),
+    paymentToken: TOKEN,
+    privateInput: {
+      provide: async () => {
+        calls.provided += 1;
+        return { schema: 'xyx.delivery', kind: 'analysis', content: { note: 'must-not-run' }, salt: SALT };
+      },
+    },
+    executor: {
+      execute: async () => {
+        calls.executed += 1;
+        return { ok: true as const, delivery: { note: 'must-not-run' } };
+      },
+    },
+    transfer: plan,
+    signer: {
+      address: PROVIDER as Address,
+      sendTransaction: async () => {
+        calls.sent += 1;
+        return { kind: 'submitted' as const, transactionHash: `0x${'72'.repeat(32)}` as Hex };
+      },
+    },
+  };
+  const runner = new ProviderRunner(config as never);
+  config.transfer = {
+    observedTransactionHash: accepted,
+    requirement: { token: TOKEN, recipient: BUYER, amountAtomic: 25_000_000n, observedTransactionHash: accepted },
+    execute: async () => {
+      markerRan += 1;
+      throw new Error('PLAN-REPLACED-MARKER');
+    },
+  };
+
+  for (const call of [() => runner.prepare(), () => runner.run()] as const) {
+    await assert.rejects(call, (error: unknown) => {
+      assert.ok(error instanceof RunnerError);
+      assert.equal(error.code, 'TRANSFER_TOKEN_MISMATCH');
+      assert.equal(error.name, 'RunnerError');
+      assert.equal(error.cause, undefined);
+      const walked = [error.name, error.message, error.code, ...(error.cause ? [String(error.cause)] : [])].join(' ');
+      assert.ok(!walked.includes('PLAN-REPLACED-MARKER'));
+      return true;
+    });
+  }
+  assert.equal(markerRan, 0);
+  assert.deepEqual(calls, { provided: 0, executed: 0, transferred: 0, sent: 0 });
+
+  // Legitimate control: the original plan object, left in place on its own
+  // runner, still reaches private input and never calls its execute hook.
+  const controlCalls = { provided: 0, executed: 0, transferred: 0, sent: 0 };
+  const control = new ProviderRunner({
+    ...BASE_CONFIG,
+    primary: reader(),
+    secondary: reader(),
+    paymentToken: TOKEN,
+    privateInput: {
+      provide: async () => {
+        controlCalls.provided += 1;
+        throw new Error('stop');
+      },
+    },
+    executor: { execute: async () => { controlCalls.executed += 1; return { ok: true as const, delivery: {} }; } },
+    transfer: plan,
+    signer: {
+      address: PROVIDER as Address,
+      sendTransaction: async () => { controlCalls.sent += 1; return { kind: 'submitted' as const, transactionHash: `0x${'73'.repeat(32)}` as Hex }; },
+    },
+  } as never);
+  await assert.rejects(() => control.prepare());
+  assert.equal(controlCalls.provided, 1);
+  assert.equal(controlCalls.executed, 0);
+  assert.equal(controlCalls.transferred, 0);
+  assert.equal(controlCalls.sent, 0);
+  assert.equal(markerRan, 0);
 });
 
 test('a task transfer paying the wrong recipient fails closed', async () => {
@@ -360,7 +844,7 @@ test('a task transfer paying the wrong recipient fails closed', async () => {
       // Right amount to the wrong recipient is a TERMS violation, not an
       // absence: the money moved and must not be mistaken for "no evidence".
       error.code === 'TRANSFER_MISMATCH' &&
-      error.message.includes(stranger)
+      !error.message.includes(stranger)
   );
 });
 
@@ -387,7 +871,7 @@ test('a task transfer of the wrong amount fails closed', async () => {
     (error: unknown) =>
       error instanceof RunnerError &&
       error.code === 'TRANSFER_NOT_OBSERVED' &&
-      error.message.includes('24999999')
+      !error.message.includes('24999999')
   );
 });
 
@@ -417,7 +901,10 @@ test('two qualifying task transfers are ambiguous and fail closed', async () => 
   await assert.rejects(
     () => runner.prepare(),
     (error: unknown) =>
-      error instanceof RunnerError && error.code === 'TRANSFER_MISMATCH' && /ambiguous|2 qualifying/.test(error.message)
+      error instanceof RunnerError &&
+      error.code === 'TRANSFER_MISMATCH' &&
+      error.message ===
+        'the task transfer receipt carries more than one transfer that satisfies the terms'
   );
 });
 
@@ -514,4 +1001,374 @@ test('an incompatible chainId is refused before anything runs', () => {
       error.code === 'CHAIN_GUARD_FAILED' &&
       /10143/.test(error.message)
   );
+});
+
+// ===========================================================================
+// A broadcast that does not finalize in time
+// ===========================================================================
+
+/**
+ * The failure this section exists to prevent: a provider runs `run()`, the signer
+ * returns a real hash, and the receipt is not yet final. The run must return
+ * status SUBMITTED and the hash — never a bare failure that drops it.
+ *
+ * A caller who loses the hash has exactly one way to recover: submit a second
+ * transaction for a job whose first delivery may already be in the mempool.
+ * That is a duplicate spending against the protocol, not a retry. So dropping
+ * the hash on a not-yet-final receipt is the mechanism by which this failure
+ * creates that second transaction, and it is worth pinning down explicitly.
+ */
+
+/** The single canonical block hash every receipt and block must agree on. */
+const PENDING_BLOCK_HASH = `0x${'33'.repeat(32)}`;
+/** A hash the signer reports as broadcast, distinct from every settled hash. */
+const PENDING_SUBMIT_HASH = `0x${'ab'.repeat(32)}` as Hex;
+/** A transfer that settles normally, so the run reaches stage 4. */
+const PENDING_TRANSFER_HASH = `0x${'5c'.repeat(32)}` as Hex;
+
+interface PendingReaderOptions {
+  /** What `getTransactionReceipt` returns for the submission hash. */
+  readonly receipt?: unknown;
+  readonly jobStatus?: number;
+  failure?: Error;
+}
+
+/**
+ * A reader that resolves the task transfer normally but does NOT resolve the
+ * submission receipt.
+ *
+ * Both hashes must be available to the runner: the transfer is what lets the
+ * run reach stage 4 at all, so if the transfer were missing here, the run would
+ * never get as far as the broadcast whose receipt is the thing under test. The
+ * submission receipt is the one deliberately withheld, which is exactly the
+ * situation: the transfer is mined, the submission just hit the mempool.
+ */
+function notFinalReader(options: PendingReaderOptions = {}) {
+  const { receipt = {}, jobStatus = fundedJob().status } = options;
+  return reader({
+    getBlock: async ({ blockNumber, blockTag }: { blockNumber?: bigint; blockTag?: string }) =>
+      blockTag === 'finalized' || blockNumber === undefined
+        ? { number: 700n, hash: PENDING_BLOCK_HASH, timestamp: 1_700_000_100n }
+        : { number: blockNumber, hash: PENDING_BLOCK_HASH, timestamp: 1_700_000_100n },
+    getTransaction: async () => ({
+      hash: PENDING_SUBMIT_HASH,
+      from: PROVIDER,
+      to: PROTOCOL,
+      input: '0x',
+      blockNumber: 700n,
+      blockHash: PENDING_BLOCK_HASH,
+    }),
+    getTransactionReceipt: async ({ hash }: { hash: Hex }) => {
+      if (hash === PENDING_TRANSFER_HASH) {
+        // The receipt's own block must agree with what getBlock reports for that
+        // block number, or the runner's finality match fails for a reason that
+        // has nothing to do with the pending submission under test. The shared
+        // fixture hardcodes a different block hash, so the block fields are set
+        // here to stay consistent with the blocks above.
+        return {
+          ...transferReceiptFrom(PENDING_TRANSFER_HASH, PROVIDER, BUYER),
+          blockNumber: 600n,
+          blockHash: PENDING_BLOCK_HASH,
+        };
+      }
+      if (options.failure) throw options.failure;
+      return receipt;
+    },
+    readContract: async ({ functionName }: { functionName: string }) => {
+      if (functionName !== 'getJob') throw new Error(`unexpected read: ${functionName}`);
+      // Both call shapes report the same job: the runner reads at the tip and
+      // again at the historical block, and a stub that answered differently
+      // would trip the runner's own storage-consistency check for the wrong
+      // reason. `deliveryCommitment` is zero because the submission in this
+      // test is allowed to be pending, so storage never records it.
+      return { ...fundedJob(), status: jobStatus as JobStatus, deliveryCommitment: `0x${'00'.repeat(32)}` };
+    },
+  });
+}
+
+function pendingRunConfig(readerFactory: () => unknown, overrides: Record<string, unknown> = {}) {
+  return {
+    ...BASE_CONFIG,
+    primary: readerFactory(),
+    secondary: readerFactory(),
+    paymentToken: TOKEN,
+    transfer: { requirement: taskRequirement(), execute: async () => PENDING_TRANSFER_HASH },
+    signer: {
+      address: PROVIDER as Address,
+      sendTransaction: async () => ({ kind: 'submitted' as const, transactionHash: PENDING_SUBMIT_HASH }),
+    },
+    ...overrides,
+  } as never;
+}
+
+test('a submission that is not yet final returns the hash with status SUBMITTED', async () => {
+  // The receipt is simply not there yet: the broadcast is real, the hash came
+  // back, and the chain has not finalized it.
+  const runner = new ProviderRunner(pendingRunConfig(() => notFinalReader({ receipt: {} })));
+
+  const { evidence } = await runner.run();
+
+  assert.equal(evidence.status, 'SUBMITTED');
+  // The whole point: the hash survives a non-final receipt.
+  assert.equal(evidence.transactionHash, PENDING_SUBMIT_HASH);
+  // Nothing is claimed as proven.
+  assert.equal(evidence.submission, undefined);
+});
+
+test('a submission that is not yet final still hands back a usable recovery handle', async () => {
+  // The recovery promise. A provider that got SUBMITTED calls settle() with the
+  // hash it was handed instead of broadcasting a second transaction. What makes
+  // that possible is exactly two things, and both are what assert them here:
+  //
+  //   1. the hash survives a non-final receipt, so there IS a hash to hand back
+  //   2. the recovery handle travels with the run, so a resumed process has the
+  //      commitment settle() is built around
+  //
+  // provider-runner-settle.test.ts covers what settle() does once the receipt has
+  // landed. This section covers what the caller is given before it does, which is
+  // the point where a hash can still be lost.
+  const reader = notFinalReader({ receipt: {} });
+  const runner = new ProviderRunner(pendingRunConfig(() => reader));
+
+  const { evidence, prepared } = await runner.run();
+
+  assert.equal(evidence.status, 'SUBMITTED');
+  assert.equal(evidence.transactionHash, PENDING_SUBMIT_HASH);
+  assert.ok(prepared, 'a pending submission must still produce a recovery handle');
+  // The handle the caller keeps must carry the commitment, and the commitment
+  // must be bound to the transfer that actually settled — otherwise the resumed
+  // run has nothing to re-derive a receipt from.
+  assert.match(prepared.commitment, /^0x[0-9a-f]{64}$/);
+  assert.equal(prepared.transfer.transactionHash, PENDING_TRANSFER_HASH);
+  // The salt must travel with the handle too: it is what lets settle() prove the
+  // payload still reproduces the commitment. A handle that carried the payload
+  // but not the salt could not be verified at all.
+  assert.match(prepared.salt, /^0x[0-9a-f]{64}$/);
+  // No submission was proven, so nothing may claim one was.
+  assert.equal(evidence.submission, undefined);
+});
+
+test('an RPC that cannot see the receipt at all still returns the hash', async () => {
+  // An endpoint that throws is indistinguishable, from the runner's side, from
+  // a receipt that has not landed. Both mean "no finality", so both must still
+  // return the hash rather than throw it away.
+  const runner = new ProviderRunner(
+    pendingRunConfig(() => notFinalReader({ failure: new Error('receipt not found') }))
+  );
+
+  const { evidence } = await runner.run();
+
+  assert.equal(evidence.status, 'SUBMITTED');
+  assert.equal(evidence.transactionHash, PENDING_SUBMIT_HASH);
+});
+
+test('an RPC disagreement fails closed and never reports a submission', async () => {
+  // The secondary disagrees about the finalized head. Both readers are consulted
+  // for every evidence claim, so this is a real conflict, not a pending receipt,
+  // and it must not be laundered into "submitted".
+  const primary = notFinalReader({});
+  const secondary = reader({
+    ...notFinalReader({}),
+    getBlock: async ({ blockNumber, blockTag }: { blockNumber?: bigint; blockTag?: string }) =>
+      blockTag === 'finalized' || blockNumber === undefined
+        ? { number: 701n, hash: `0x${'99'.repeat(32)}`, timestamp: 1_700_000_200n }
+        : { number: blockNumber, hash: PENDING_BLOCK_HASH, timestamp: 1_700_000_100n },
+  });
+  const runner = new ProviderRunner(pendingRunConfig(() => primary, { primary, secondary }));
+
+  await assert.rejects(
+    () => runner.run(),
+    (error: unknown) => error instanceof RunnerError && error.code === 'RECEIPT_RPC_CONFLICT'
+  );
+});
+
+test('a reverted submission is never indistinguishable from a pending one', async () => {
+  // The submission receipt EXISTS and says the transaction reverted. That is
+  // settled evidence of a bad outcome, not the absence of evidence.
+  //
+  // The runner reports this as status SUBMITTED with a failure block, because a
+  // revert is still a real broadcast whose hash the caller needs. The invariant
+  // is not the status label — it is that the revert is *distinguishable*. A
+  // revert silently reported as "pending" would invite the caller to resend a
+  // transaction whose outcome is already known.
+  const runner = new ProviderRunner(
+    pendingRunConfig(() =>
+      notFinalReader({
+        receipt: {
+          transactionHash: PENDING_SUBMIT_HASH,
+          blockNumber: 700n,
+          blockHash: PENDING_BLOCK_HASH,
+          status: 'reverted',
+          to: PROTOCOL,
+          logs: [],
+        },
+      })
+    )
+  );
+
+  const { evidence } = await runner.run();
+
+  assert.equal(evidence.status, 'SUBMITTED');
+  assert.equal(evidence.transactionHash, PENDING_SUBMIT_HASH);
+  // The failure block must say the broadcast itself failed, not that it is
+  // merely unconfirmed — the caller must not read this as "try again later".
+  assert.equal(evidence.failure?.code, 'SUBMISSION_REVERTED');
+});
+
+const FABRICATED_URL = 'https://collaborator.example.invalid/raw-rpc';
+const FABRICATED_HEADER = 'x-marker-token: COLLABORATOR-HEADER-MUST-NOT-SURFACE';
+const FABRICATED_PLAINTEXT = 'PLAINTEXT-MARKER-MUST-NOT-SURFACE';
+
+function walkPublic(value: unknown, out: string[] = [], depth = 0): string {
+  if (depth > 6 || value === null || value === undefined) return out.join('\u0000');
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+    out.push(String(value));
+    return out.join('\u0000');
+  }
+  if (value instanceof Error) {
+    out.push(value.name, value.message);
+    const coded = value as { code?: unknown; cause?: unknown };
+    if (coded.code !== undefined) out.push(String(coded.code));
+    if (coded.cause !== undefined) walkPublic(coded.cause, out, depth + 1);
+    for (const key of Object.getOwnPropertyNames(value)) {
+      if (key === 'stack') continue;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor && 'value' in descriptor) walkPublic(descriptor.value, out, depth + 1);
+    }
+    return out.join('\u0000');
+  }
+  if (typeof value === 'object') {
+    for (const entry of Object.values(value as Record<string, unknown>)) walkPublic(entry, out, depth + 1);
+  }
+  return out.join('\u0000');
+}
+
+test('a signer result built outside the runner is rejected, and a real submitted result is accepted', async () => {
+  // Old behavior: the signer's `reason` was interpolated into RunStep.detail and
+  // RunEvidence.failure.message. The rejected result below is a plain object, not
+  // one the runner or a shared helper constructed.
+  const hostile = {
+    kind: 'rejected' as const,
+    reason: `${FABRICATED_PLAINTEXT} ${FABRICATED_URL} ${FABRICATED_HEADER}`,
+    cause: new Error(`${FABRICATED_URL} connection reset`),
+  };
+  const hostileRunner = new ProviderRunner(
+    pendingRunConfig(() => notFinalReader({ receipt: {} }), {
+      signer: { address: PROVIDER as Address, sendTransaction: async () => hostile },
+    })
+  );
+  const hostileOutcome = await hostileRunner.run();
+  assert.equal(hostileOutcome.evidence.status, 'FAILED');
+  assert.equal(hostileOutcome.evidence.failure?.code, 'SEND_FAILED');
+  assert.equal(hostileOutcome.evidence.transactionHash, undefined);
+  assert.equal(hostileOutcome.evidence.submission, undefined);
+  assert.ok(hostileOutcome.prepared?.commitment);
+  assert.equal(hostileOutcome.prepared?.request.functionName, 'submitDelivery');
+  const hostileText = walkPublic(hostileOutcome);
+  assert.ok(!hostileText.includes(FABRICATED_PLAINTEXT), hostileText.slice(0, 240));
+  assert.ok(!hostileText.includes(FABRICATED_URL));
+  assert.ok(!hostileText.includes(FABRICATED_HEADER));
+  assert.ok(!hostileText.includes('connection reset'));
+  for (const step of hostileOutcome.evidence.steps) {
+    assert.ok(!step.detail.includes(FABRICATED_PLAINTEXT));
+    assert.ok(!step.detail.includes('example.invalid'));
+  }
+
+  // Legitimate control: an independently spelled submitted result still returns
+  // the hash and a recovery handle, and does not claim the receipt is final.
+  const honestHash = `0x${'71'.repeat(32)}` as Hex;
+  const honest = { kind: 'submitted' as const, transactionHash: honestHash };
+  const honestRunner = new ProviderRunner(
+    pendingRunConfig(() => notFinalReader({ receipt: {} }), {
+      signer: { address: PROVIDER as Address, sendTransaction: async () => honest },
+    })
+  );
+  const honestOutcome = await honestRunner.run();
+  assert.equal(honestOutcome.evidence.status, 'SUBMITTED');
+  assert.equal(honestOutcome.evidence.transactionHash, honestHash);
+  assert.equal(honestOutcome.evidence.submission, undefined);
+  assert.equal(honestOutcome.evidence.failure?.code, 'RECEIPT_NOT_FINALIZED');
+  assert.equal(honestOutcome.prepared?.transfer.transactionHash, PENDING_TRANSFER_HASH);
+  assert.ok(!walkPublic(honestOutcome.evidence.steps).includes(FABRICATED_PLAINTEXT));
+});
+
+test('an executor result built outside the runner cannot put its text on the thrown error', async () => {
+  // Old behavior: `{ ok: false, reason }` was copied into RunnerError.message.
+  // This result is a standalone object with a nested cause, not the executor
+  // helper used by the successful cases above.
+  jobState = cloneJob();
+  const leaked = new Error(FABRICATED_URL);
+  (leaked as Error & { code?: string }).code = FABRICATED_HEADER;
+  const executor = {
+    execute: async () => ({
+      ok: false as const,
+      reason: FABRICATED_PLAINTEXT,
+      detail: { url: FABRICATED_URL, header: FABRICATED_HEADER },
+      cause: leaked,
+    }),
+  };
+  const runner = new ProviderRunner({
+    ...BASE_CONFIG,
+    executor,
+    primary: reader(),
+    secondary: reader(),
+    paymentToken: TOKEN,
+    transfer: { requirement: taskRequirement(), execute: async () => PENDING_TRANSFER_HASH },
+  } as never);
+
+  let thrown: unknown;
+  try {
+    await runner.prepare();
+  } catch (error) {
+    thrown = error;
+  }
+  assert.ok(thrown instanceof RunnerError);
+  assert.equal(thrown.code, 'EXECUTION_FAILED');
+  assert.equal(thrown.name, 'RunnerError');
+  const text = walkPublic(thrown);
+  assert.ok(!text.includes(FABRICATED_PLAINTEXT));
+  assert.ok(!text.includes(FABRICATED_URL));
+  assert.ok(!text.includes(FABRICATED_HEADER));
+  assert.equal((thrown as { cause?: unknown }).cause, undefined);
+
+  // Legitimate control: the stock executor still produces a transferred run.
+  const controlReader = () =>
+    reader({
+      getTransactionReceipt: async () => transferReceiptFrom(PENDING_TRANSFER_HASH, PROVIDER, BUYER),
+    });
+  const control = new ProviderRunner({
+    ...BASE_CONFIG,
+    primary: controlReader(),
+    secondary: controlReader(),
+    paymentToken: TOKEN,
+    transfer: { requirement: taskRequirement(), execute: async () => PENDING_TRANSFER_HASH },
+  } as never);
+  const { evidence, prepared } = await control.prepare();
+  assert.equal(evidence.status, 'TRANSFERRED');
+  assert.equal(evidence.failure, undefined);
+  assert.equal(evidence.transfer?.transactionHash, PENDING_TRANSFER_HASH);
+  assert.equal(prepared?.request.functionName, 'submitDelivery');
+  assert.equal(prepared?.transfer.sender, PROVIDER);
+  assert.ok(!walkPublic(evidence).includes(FABRICATED_PLAINTEXT));
+});
+
+test('a pending submission reports no runner-authored text from the reader', async () => {
+  // An injected reader that throws endpoint text into its error. A not-yet-final
+  // branch is still public output: the code must classify the failure without
+  // forwarding where it was looking.
+  const runner = new ProviderRunner(
+    pendingRunConfig(() =>
+      notFinalReader({ failure: new Error('https://rpc.example.invalid/v1/KEY-THAT-MUST-NOT-LEAK') })
+    )
+  );
+
+  const { evidence } = await runner.run();
+
+  assert.equal(evidence.status, 'SUBMITTED');
+  for (const step of evidence.steps) {
+    assert.ok(
+      !step.detail.includes('KEY-THAT-MUST-NOT-LEAK') && !step.detail.includes('rpc.example.invalid'),
+      `step log leaked reader transport text: ${step.detail}`
+    );
+  }
 });

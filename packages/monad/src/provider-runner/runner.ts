@@ -219,6 +219,19 @@ export interface RunEvidence {
   readonly deliveryCommitment?: Hex;
   /** The exact canonical contract request, for wallet display and diffing. */
   readonly request?: ContractRequest;
+  /**
+   * The `submitDelivery` transaction hash this runner broadcast, when one is known.
+   *
+   * Present on every status after a successful send — `FINALIZED`, the pending
+   * `SUBMITTED`, and any final failure that came after a hash existed — because
+   * it is the anchor for recovery. A caller holding this hash calls `settle()`
+   * instead of broadcasting again; a caller without it can only resend, and
+   * resending is a second transaction for a job the first may already carry on
+   * chain. Losing the hash is how an interrupted run becomes a duplicate spend.
+   *
+   * Absent, not null, when no send was ever attempted.
+   */
+  readonly transactionHash?: Hex;
   readonly steps: readonly RunStep[];
   readonly failure?: { readonly code: RunFailureCode; readonly message: string };
 }
@@ -253,6 +266,22 @@ export interface TaskTransferPlan {
 export interface PreparedDelivery {
   readonly delivery: PrivateDeliveryInput;
   readonly commitment: Hex;
+  /**
+   * The salt that produced `commitment`.
+   *
+   * Present on this object so that `settle()` can prove the delivery payload is
+   * the one the protocol committed to: recomputing the commitment from
+   * `delivery` and this salt, and requiring it to equal `commitment`, is the only
+   * check that ties a caller-supplied payload to an on-chain fact. Without it the
+   * payload would be an unbacked assertion, and `settle()` must not read a
+   * locator out of one.
+   *
+   * This is the one private value the recovery path requires, because the
+   * recovery path's job is to re-prove something the runner itself committed.
+   * An interrupted client keeps this object; a hostile one still cannot forge a
+   * payload that survives the check.
+   */
+  readonly salt: Hex;
   readonly transfer: ObservedTransfer;
   readonly request: ContractRequest;
   readonly observation: CanonicalFinalizedBlock;
@@ -302,8 +331,229 @@ export interface RunOutcome {
 const ZERO_WORD = /^0x0{64}$/i;
 const HASH_RE = /^0x[0-9a-fA-F]{64}$/;
 
+// ---------------------------------------------------------------------------
+// Runner-authored failure text
+// ---------------------------------------------------------------------------
+
+/**
+ * Every string below is written by this module and interpolates nothing.
+ *
+ * `RunnerError` messages, `RunStep` records, and `RunEvidence` are public
+ * output. The runner is the component a UI, a log aggregator, and another
+ * program all read, and several of the things that feed it are written by
+ * someone else about work the runner cannot see:
+ *
+ *   - an executor that throws may quote the payload, or the private input it was
+ *     handed, or its own stack;
+ *   - a private-input provider that throws may quote the job it was given;
+ *   - a signer's rejection reason quotes the transaction it refused, and its
+ *     own transport errors, including authorization headers;
+ *   - a task-transfer hook throws about the request it was about to send;
+ *   - an injected RPC reader's transport error carries its endpoint URL, its
+ *     API key, and the request body it failed on.
+ *
+ * None of that is safe to forward. So the runner emits its own stable text and
+ * keeps the code as the contract — a caller branches on `.code` and a human
+ * reads a sentence that says which stage failed without saying what it saw.
+ * Interpolating anything here would re-open the hole for every future caller.
+ *
+ * The one exception is the `settle()` payload proof below, which is deliberately
+ * not a message but a recomputation: see `provePayloadBindsCommitment`.
+ */
+const EXECUTION_FAILURE_MESSAGE =
+  'the task executor threw instead of returning a result; the run is not executable';
+/** The executor returned `{ ok: false }` rather than a delivery. */
+const EXECUTION_DECLINED_MESSAGE =
+  'the task executor declined to produce a delivery; the run is not executable';
+const PRIVATE_INPUT_THROWN =
+  'the private input provider threw instead of returning material';
+const SEND_REJECTED_MESSAGE =
+  'the signer refused the submitDelivery request; no transaction was broadcast and nothing was submitted';
+/** The transfer hook threw instead of returning the hash of the transfer it performed. */
+const TRANSFER_HOOK_THREW =
+  'the task transfer hook threw instead of performing the required work';
+/** The delivery payload does not hash to the commitment the job actually carries. */
+const PAYLOAD_COMMITMENT_MISMATCH =
+  'the prepared delivery payload does not reproduce the delivery commitment the job carries on chain';
+/** The recovery payload is present but carries no salt, so it cannot be proven. */
+const PREPARED_SALT_MISSING =
+  'the prepared delivery carries a payload but no salt, so it cannot be proven to belong to this job';
+/** The recovery salt was missing or malformed, so no payload can be proven at all. */
+const PREPARED_SALT_INVALID =
+  'the prepared delivery payload cannot be proven because the recovery salt is not a 32-byte hex value';
+/** The payload failed the runner's own canonical schema, without echoing which field or value. */
+const PAYLOAD_NOT_CANONICAL =
+  'the assembled delivery payload does not satisfy the canonical delivery schema';
+/** A commitment could not be computed from the validated payload and salt. */
+const COMMITMENT_NOT_COMPUTABLE =
+  'the delivery commitment could not be computed from the validated payload';
+/** The canonical submitDelivery request could not be built from this runner's configuration. */
+const REQUEST_NOT_BUILDABLE =
+  'the canonical submitDelivery request could not be built from this runner configuration';
+/** The two readers disagreed about finalized chain state; no single answer exists. */
+const READERS_DISAGREE =
+  'the two RPC readers reported conflicting finalized chain state, so no single answer exists';
+/** A reader could not answer a job read at all. */
+const READ_JOB_NOT_AVAILABLE =
+  'the RPC readers could not return the job state, so the run cannot be grounded';
+/** The two readers described the same transaction differently. */
+const FINALITY_MISMATCH =
+  'the two RPC readers reported conflicting finalized evidence for the same transaction';
+/** The receipt exists on some reader but is not usable as proof yet. */
+const RECEIPT_NOT_USABLE_YET =
+  'the transaction receipt is not usable as proof yet; reconcile with settle() using the returned hash';
+/** The transfer receipt exists but is not usable as proof yet. */
+const TRANSFER_NOT_USABLE_YET =
+  'the task transfer receipt is not usable as proof yet';
+/**
+ * A broadcast is real but its receipt has not landed yet.
+ *
+ * Says what the caller must do — reconcile with `settle()` using the hash — so
+ * the message itself carries the instruction that makes the hash useful. It
+ * deliberately names no transaction, block, or endpoint.
+ */
+const BROADCAST_NOT_YET_FINAL =
+  'the submission was broadcast and its hash is known, but its receipt is not finalized yet. ' +
+  'Reconcile with settle() using the returned hash; do not resend.';
+
+/**
+ * Errors that must stay final rather than be relabelled pending.
+ *
+ * A pending status exists to describe the absence of evidence. A dual-RPC
+ * conflict is the opposite: two independent readers answered differently, so
+ * there is evidence of disagreement and no single answer to build on. Choosing
+ * "not final" over "conflicted" would let one cooperating pair of endpoints turn
+ * a disagreement into a benign wait, which is exactly how an attacker who
+ * controls one reader buys time to decide what the runner believes.
+ */
+/** The injected signer is not the provider that owns the job on chain. */
+const SIGNER_NOT_PROVIDER_MESSAGE =
+  'the injected signer is not the provider the job names on chain, so it cannot submit for this job';
+/** The job is not in a state that accepts a delivery. */
+const JOB_NOT_FUNDED_MESSAGE =
+  'the job is not in a state that accepts a delivery';
+/** The job cannot be submitted to in its current state. */
+const JOB_NOT_SUBMITTABLE_MESSAGE =
+  'the job is not in a state that accepts a submission';
+/** The job already carries a delivery commitment, so submitting again would revert. */
+const JOB_ALREADY_CARRIES_COMMITMENT_MESSAGE =
+  'the job already carries a delivery commitment, so submitting again would revert';
+/** The chain says the job has not been submitted yet, which settle() requires. */
+const JOB_NOT_YET_SUBMITTED_MESSAGE =
+  'the job has not been submitted on chain yet; settle() expects a submission that has already landed';
+/** The finalized transfer receipt says the transfer itself reverted. */
+const TRANSFER_REVERTED_MESSAGE =
+  'the task transfer receipt shows the transfer reverted, so the required work was not performed';
+/** The transfer was sent by an address that is not the job provider. */
+const TRANSFER_SENDER_MISMATCH_MESSAGE =
+  'the task transfer was sent by an address that is not the job provider';
+/** Two spellings of the payment token in this configuration disagree. */
+const TRANSFER_TOKEN_DISAGREEMENT_MESSAGE =
+  'the token the transfer moved is not the protocol payment token this run is bound to';
+
+/**
+ * A broadcast whose finalized receipt says it reverted.
+ *
+ * Says the submission is done and failed, not that it is unconfirmed — the two
+ * look alike to a caller who only reads the status, and the difference is the
+ * whole point: a revert is a conclusion, a pending receipt is a wait.
+ */
+const SUBMISSION_REVERTED_MESSAGE =
+  'the submission was broadcast and reverted on chain; the delivery was not submitted';
+
+/** The submission receipt targeted a contract that is not the protocol. */
+const RECEIPT_WRONG_TARGET_MESSAGE =
+  'the submission receipt targeted a contract that is not the delivery protocol';
+/** The submission receipt carries no DeliverySubmitted event from the protocol. */
+const RECEIPT_NO_SUBMISSION_EVENT_MESSAGE =
+  'the submission receipt carries no DeliverySubmitted event from the delivery protocol';
+/** The submission receipt carries more than one DeliverySubmitted event. */
+const RECEIPT_SUBMISSION_EVENTS_AMBIGUOUS_MESSAGE =
+  'the submission receipt carries more than one DeliverySubmitted event, so the submission proven is ambiguous';
+/** The receipt's event names a job other than the one this runner selected. */
+const RECEIPT_WRONG_JOB_MESSAGE =
+  'the submission receipt proves a delivery for a different job';
+/** The receipt's event names a provider other than the one the job names on chain. */
+const RECEIPT_WRONG_PROVIDER_MESSAGE =
+  'the submission receipt names a provider other than the one the job carries on chain';
+/** The receipt's event names a commitment other than the one this run built. */
+const RECEIPT_WRONG_COMMITMENT_MESSAGE =
+  'the submission receipt names a delivery commitment other than the one this run computed';
+/** Job storage at the mined block does not reflect the submitted log. */
+const RECEIPT_STORAGE_NOT_REFLECTED_MESSAGE =
+  'job storage does not reflect the submitted event at the block where it was mined';
+/** Job storage at the mined block carries a different commitment. */
+const RECEIPT_STORAGE_COMMITMENT_MISMATCH_MESSAGE =
+  'job storage carries a delivery commitment other than the one this run computed';
+/** A transfer that satisfies the terms was paid, but to someone else. */
+const TRANSFER_WRONG_RECIPIENT_MESSAGE =
+  'the task transfer paid the required amount to a recipient that is not the required one';
+/** A transfer of the protocol token moved, but of the wrong amount. */
+const TRANSFER_WRONG_AMOUNT_MESSAGE =
+  'the task transfer moved an amount of the protocol token other than the required one';
+/** The transfer receipt carries no token Transfer log at all. */
+const TRANSFER_NO_LOG_MESSAGE =
+  'the task transfer receipt carries no token transfer, so the required work is unproven';
+/** More than one transfer satisfies the terms. */
+const TRANSFER_AMBIGUOUS_MESSAGE =
+  'the task transfer receipt carries more than one transfer that satisfies the terms';
+
+const NEVER_PENDING_CODES: readonly RunFailureCode[] = [
+  'RECEIPT_RPC_CONFLICT',
+  'TRANSFER_RPC_CONFLICT',
+];
+
+/** Whether a runner error is a finality conflict, which may never be reported pending. */
+function isFinalityConflict(error: RunnerError): boolean {
+  return NEVER_PENDING_CODES.includes(error.code);
+}
+
+/**
+ * Read the transfer locator out of a proven delivery payload.
+ *
+ * The locator is `content.transferTx` — the same field `bindDelivery` writes when
+ * it records which transfer satisfied the job. It is read only from a payload
+ * whose commitment has already been recomputed and matched, so the value here is
+ * the one this run itself put into the commitment. Returning `undefined` when the
+ * field is absent or not a 32-byte value makes "no locator" and "bad locator"
+ * both non-fatal: `settleTransfer` then falls back to the config-supplied hash
+ * and re-derives the terms from chain state as it always does.
+ */
+function extractTransferLocator(delivery: PrivateDeliveryInput): Hex | undefined {
+  const content = delivery.content;
+  const raw = content !== undefined && typeof content === 'object' ? content.transferTx : undefined;
+  return typeof raw === 'string' && /^0x[0-9a-fA-F]{64}$/.test(raw) ? (raw as Hex) : undefined;
+}
+
 export class ProviderRunner {
   private readonly steps: RunStep[] = [];
+  /**
+   * The token and requirement accepted at construction.
+   *
+   * The config object is held by reference and is not frozen, so a caller can
+   * replace `paymentToken` or `requirement.token` after `new` and before
+   * `prepare()`. Later stages read `this.config` again. These copies are what
+   * those stages compare against, so a mutation cannot move the check that
+   * already passed.
+   */
+  private readonly acceptedPaymentToken: Address;
+  private readonly acceptedRequirement: TaskTransferRequirement;
+  /** The plan-level locator accepted at construction, if one was configured. */
+  private readonly acceptedPlanLocator: Hex | undefined;
+  /**
+   * The transfer plan object accepted at construction.
+   *
+   * Field copies do not cover a replacement plan whose token, recipient,
+   * amount, and hashes match but whose execute hook is different. The hook is
+   * a capability, so the object itself is what later stages must still hold.
+   */
+  private readonly acceptedTransfer: TaskTransferPlan;
+  /**
+   * The execute hook accepted at construction, or undefined when the plan has
+   * none. Object identity does not cover a later assignment to `execute` on
+   * the same plan, and that hook is what settleTransfer calls.
+   */
+  private readonly acceptedExecute: TaskTransferPlan['execute'];
 
   constructor(private readonly config: ProviderRunnerConfig) {
     if (typeof config.jobId !== 'bigint' || config.jobId <= 0n) {
@@ -323,6 +573,41 @@ export class ProviderRunner {
     if (typeof config.paymentToken !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(config.paymentToken)) {
       throw new RunnerError('TRANSFER_MISMATCH', 'the protocol payment token must be an address');
     }
+    // Compare the two spellings of "the token this job pays in" now, in the
+    // constructor, before a single stage has run. They are configured in two
+    // places by the integrator, and a mismatch is not something chain state can
+    // reveal: a delivery would be paid in one token and bound against another,
+    // and the job would settle as if it had earned a payment it never received.
+    //
+    // Catching it here is also the only place it is free. Downstream the failure
+    // arrives after the private input has been decrypted, the executor has run,
+    // and possibly a transfer has already been broadcast — at which point the
+    // misconfiguration has already cost a call, a secret, or money.
+    //
+    // The comparison is case-insensitive because these are EIP-55 addresses
+    // written by different tools, which differ in checksum casing while naming
+    // the same contract.
+    //
+    // TRANSFER_TOKEN_MISMATCH rather than the broader TRANSFER_MISMATCH: the
+    // config is disagreeing with itself about which token this job pays in, and
+    // a caller triaging by code should not have to look at chain state that was
+    // never read to tell that apart from a chain-observed wrong token.
+    if (!sameAddress(config.transfer.requirement.token, config.paymentToken)) {
+      throw new RunnerError(
+        'TRANSFER_TOKEN_MISMATCH',
+        'the configured payment token and the required task transfer token do not agree'
+      );
+    }
+    this.acceptedPaymentToken = config.paymentToken;
+    this.acceptedTransfer = config.transfer;
+    this.acceptedExecute = config.transfer.execute;
+    this.acceptedPlanLocator = config.transfer.observedTransactionHash;
+    this.acceptedRequirement = {
+      token: config.transfer.requirement.token,
+      recipient: config.transfer.requirement.recipient,
+      amountAtomic: config.transfer.requirement.amountAtomic,
+      observedTransactionHash: config.transfer.requirement.observedTransactionHash,
+    };
     if (this.config.chainId !== undefined && this.config.chainId !== MONAD_TESTNET_CHAIN_ID) {
       throw new RunnerError('CHAIN_GUARD_FAILED', `only chain ID ${MONAD_TESTNET_CHAIN_ID} is supported`);
     }
@@ -339,10 +624,12 @@ export class ProviderRunner {
    * exact request a wallet will be asked to approve.
    */
   async prepare(): Promise<RunOutcome> {
+    this.recheckAcceptedTokens();
     const { job, observation } = await this.selectJob();
     const material = await this.readPrivateInput(job);
     const executed = await this.executeTask(job, material);
-    const transfer = await this.settleTransfer(job);
+    const settledTransfer = await this.settleTransfer(job);
+    const transfer = settledTransfer.transfer;
     const prepared = await this.bindDelivery(job, material, executed, transfer, observation);
     this.record('TRANSFERRED', 'task transfer settled and delivery commitment computed');
     return {
@@ -366,8 +653,14 @@ export class ProviderRunner {
    * This is the recovery path for an interrupted run — a crashed or closed
    * client that already sent `submitDelivery` calls this instead of `run()`, so it
    * never broadcasts a second transaction for a job that was already submitted.
+   *
+   * The `salt` on the prepared delivery is what turns `prepared.delivery` from an
+   * assertion into evidence: the runner recomputes the commitment from the
+   * payload and the salt, and requires it to equal the commitment the job carries
+   * on chain. A caller who lost or fabricated the salt cannot pass that check.
    */
   async settle(prepared: PreparedDelivery, transactionHash: Hex): Promise<RunOutcome> {
+    this.recheckAcceptedTokens();
     if (!prepared || typeof prepared.commitment !== 'string' || !HASH_RE.test(prepared.commitment)) {
       throw new RunnerError('COMMITMENT_INVALID', 'prepared delivery with a valid commitment is required');
     }
@@ -377,6 +670,34 @@ export class ProviderRunner {
     if (typeof transactionHash !== 'string' || !HASH_RE.test(transactionHash)) {
       throw new RunnerError('SUBMISSION_NOT_OBSERVED', 'a 32-byte transaction hash is required to settle');
     }
+    // Prove the payload before reading anything out of it. Recovery input comes
+    // from whoever resumes the run, so `prepared.delivery` is caller-controlled
+    // data: the transfer locator inside it is only trustworthy once the payload
+    // carrying that locator has been shown to hash back to the commitment this
+    // run put on chain. Proving it first means a forged payload can never direct
+    // a re-observing read.
+    let observedJob: JobData;
+    let recoveredHash: Hex | undefined;
+    if (prepared.delivery !== undefined) {
+      // Prove the payload before reading anything out of it. Recovery input comes
+      // from whoever resumes the run, so `prepared.delivery` is caller-controlled
+      // data: the transfer locator inside it is only trustworthy once the payload
+      // carrying that locator has been shown to hash back to the commitment this
+      // run put on chain. Proving it first means a forged payload can never direct
+      // a re-observing read.
+      //
+      // The salt it needs is part of the same proof, so a caller who cannot
+      // reproduce the commitment cannot pass any part of this branch.
+      const salt = prepared.salt;
+      if (salt !== undefined) {
+        this.provePayloadBindsCommitment(prepared.commitment, prepared.delivery, salt);
+        // The locator only becomes usable once the payload carrying it is proven,
+        // so it is read out here rather than trusted from the caller.
+        recoveredHash = extractTransferLocator(prepared.delivery);
+      } else {
+        throw new RunnerError('PRIVATE_INPUT_INVALID', PREPARED_SALT_MISSING);
+      }
+    }
     // Re-read the job at the finalized head before verifying: this run may be
     // resuming hours later, and an integrator must not be able to settle a hash
     // against a job that has since been cancelled or resolved.
@@ -384,7 +705,6 @@ export class ProviderRunner {
     // Read from BOTH readers. settle() is the recovery path most likely to be
     // run much later against a different RPC endpoint, so one reader's word is
     // not enough to declare the job Submitted.
-    let observedJob: JobData;
     try {
       observedJob = await matchedCanonicalJobHere(
         this.config.primary,
@@ -393,42 +713,138 @@ export class ProviderRunner {
         this.config.jobId
       );
     } catch (error) {
-      throw new RunnerError(
-        messageOf(error).includes('RPC_STATE_MISMATCH') ? 'RECEIPT_RPC_CONFLICT' : 'JOB_READ_FAILED',
-        messageOf(error)
-      );
+      // The readers are caller-injected, so their transport errors can embed an
+      // RPC endpoint URL, an API key, or a request body. The sentinel string is
+      // what classifies the failure; the message is runner-authored, keyed only
+      // to whether the two readers conflicted.
+      throw readerFailure(error);
     }
     if (observedJob.status !== CANONICAL_JOB_STATUS.Submitted) {
       throw new RunnerError(
         'JOB_ALREADY_SUBMITTED',
-        `job ${this.config.jobId} is ${jobStatusName(observedJob.status)}; settle() expects a submission that has already landed`
+        JOB_NOT_YET_SUBMITTED_MESSAGE
       );
     }
     if (observedJob.deliveryCommitment.toLowerCase() !== prepared.commitment.toLowerCase()) {
       throw new RunnerError(
         'RECEIPT_COMMITMENT_MISMATCH',
-        `job carries deliveryCommitment ${observedJob.deliveryCommitment}, not the prepared ${prepared.commitment}`
+        PAYLOAD_COMMITMENT_MISMATCH
       );
     }
-    const submission = await this.verifySubmission(
-      observedJob,
-      prepared.request,
-      prepared.commitment,
-      transactionHash
-    );
+    if (!sameAddress(this.config.signer?.address ?? observedJob.provider, observedJob.provider)) {
+      throw new RunnerError(
+        'SIGNER_NOT_PROVIDER',
+        SIGNER_NOT_PROVIDER_MESSAGE
+      );
+    }
+
+    // Re-observe the transfer from both readers rather than trusting the caller's
+    // object. settle() runs against a chain that has moved on since the original
+    // run, so the transfer's terms must be re-established from canonical state,
+    // not replayed from an object an interrupted process was holding.
+    const settledTransfer = await this.settleTransfer(observedJob, recoveredHash);
+    const transfer = settledTransfer.transfer;
+    const transferHead = settledTransfer.observation;
+
+    // Rebuild the canonical request from this runner's own configuration and the
+    // chain's own facts. A recovered run may carry a config edited since it
+    // started, and the receipt is only evidence for the exact call that produced
+    // it — so the request used to verify here is the one this runner computes
+    // now, not the one it was handed.
+    let request: ContractRequest;
+    try {
+      request = buildSubmitRequest(
+        {
+          jobId: this.config.jobId,
+          deliveryCommitment: observedJob.deliveryCommitment,
+          // The observed provider, not the caller's: the receipt must name the
+          // provider the chain says owns the job.
+          provider: observedJob.provider,
+        },
+        this.config.addresses,
+        this.config.chainId ?? MONAD_TESTNET_CHAIN_ID
+      );
+    } catch {
+      throw new RunnerError('REQUEST_INVALID', REQUEST_NOT_BUILDABLE);
+    }
+    // The rebuilt request must be a well-formed canonical call: the same guard
+    // prepare() applies to the request it broadcasts.
+    if (typeof request.address !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(request.address)) {
+      throw new RunnerError('REQUEST_INVALID', REQUEST_NOT_BUILDABLE);
+    }
+
+    let submission: ObservedSubmission;
+    try {
+      submission = await this.verifySubmission(observedJob, request, prepared.commitment, transactionHash);
+    } catch (error) {
+      // A known hash whose receipt is simply not final yet is the case settle()
+      // exists for. Throwing here drops the hash the caller just handed over.
+      // Disagreement and a reverted receipt stay their own failures: those are
+      // settled facts, not an invitation to wait or to broadcast again.
+      if (
+        error instanceof RunnerError &&
+        error.code === 'RECEIPT_NOT_FINALIZED' &&
+        !isFinalityConflict(error)
+      ) {
+        this.record('SUBMITTED', BROADCAST_NOT_YET_FINAL);
+        return {
+          evidence: {
+            status: 'SUBMITTED',
+            jobId: this.config.jobId,
+            job: observedJob,
+            transfer,
+            deliveryCommitment: observedJob.deliveryCommitment,
+            request,
+            transactionHash,
+            steps: [...this.steps],
+            failure: { code: 'RECEIPT_NOT_FINALIZED', message: BROADCAST_NOT_YET_FINAL },
+          },
+          prepared: this.sanitizedRecovery(prepared, transfer, request, observedJob, transferHead),
+        };
+      }
+      throw error;
+    }
     return {
       evidence: {
         status: 'FINALIZED',
         jobId: this.config.jobId,
         job: observedJob,
         observation: submission.observation,
-        transfer: prepared.transfer,
+        transfer,
         submission,
-        deliveryCommitment: prepared.commitment,
-        request: prepared.request,
+        deliveryCommitment: observedJob.deliveryCommitment,
+        request,
+        transactionHash,
         steps: [...this.steps],
       },
-      prepared,
+      prepared: this.sanitizedRecovery(prepared, transfer, request, observedJob, submission.observation),
+    };
+  }
+
+  /**
+   * A recovery handle built only from facts this call just proved.
+   *
+   * The object `settle()` was given is caller-controlled, including after its
+   * commitment has been checked. Returning it would publish a fabricated
+   * transfer, request, observation, or job beside evidence that was rebuilt
+   * from the chain. The delivery and salt are the proven payload; everything
+   * else is replaced with this call's observations.
+   */
+  private sanitizedRecovery(
+    prepared: PreparedDelivery,
+    transfer: ObservedTransfer,
+    request: ContractRequest,
+    job: JobData,
+    observation: CanonicalFinalizedBlock
+  ): PreparedDelivery {
+    return {
+      delivery: prepared.delivery,
+      commitment: prepared.commitment,
+      salt: prepared.salt,
+      transfer,
+      request,
+      observation,
+      job,
     };
   }
 
@@ -437,6 +853,7 @@ export class ProviderRunner {
    * signer, and verify the finalized receipt. Requires a signer.
    */
   async run(): Promise<RunOutcome> {
+    this.recheckAcceptedTokens();
     const signer = this.requireSigner();
     const { evidence, prepared } = await this.prepare();
     if (evidence.status === 'FAILED' || !prepared) return { evidence };
@@ -445,13 +862,90 @@ export class ProviderRunner {
     const sendOutcome = await signer.sendTransaction(prepared.request);
 
     if (sendOutcome.kind === 'submitted') {
-      this.record('SUBMITTED', `broadcast returned hash ${sendOutcome.transactionHash}; nothing is yet proven`);
-      const verified = await this.verifySubmission(
-        prepared.job,
-        prepared.request,
-        prepared.commitment,
-        sendOutcome.transactionHash
-      );
+      this.record('SUBMITTED', 'broadcast returned a transaction hash; nothing is yet proven');
+
+      // Only a genuinely absent or non-final receipt may be relabelled pending.
+      // Everything else — a reverted broadcast, a receipt for the wrong job or
+      // provider or commitment, two readers that disagree — is settled evidence
+      // of a *bad* outcome, not the absence of evidence, and it must fail its
+      // own way rather than be laundered into "try again later".
+      //
+      // Why the hash has to survive: a caller that gets SUBMITTED calls settle()
+      // with the hash it was handed instead of broadcasting again. Dropping that
+      // hash leaves resending as the only recovery, and resending is a second
+      // transaction for a job the first may already be on chain for — a
+      // duplicate spend against the protocol, not a retry.
+      let verified: ObservedSubmission;
+      try {
+        verified = await this.verifySubmission(
+          prepared.job,
+          prepared.request,
+          prepared.commitment,
+          sendOutcome.transactionHash
+        );
+      } catch (error) {
+        if (
+          error instanceof RunnerError &&
+          error.code === 'RECEIPT_NOT_FINALIZED' &&
+          !isFinalityConflict(error)
+        ) {
+          this.record('SUBMITTED', BROADCAST_NOT_YET_FINAL);
+          return {
+            evidence: {
+              status: 'SUBMITTED',
+              jobId: this.config.jobId,
+              job: evidence.job,
+              observation: evidence.observation,
+              transfer: prepared.transfer,
+              deliveryCommitment: prepared.commitment,
+              // The canonical request this runner itself built and sent, not a
+              // re-derivation: the caller needs the exact call it made.
+              request: prepared.request,
+              transactionHash: sendOutcome.transactionHash,
+              steps: [...this.steps],
+              // The hash is described, not echoed here, because `transactionHash`
+              // above already carries it in a structured field.
+              failure: {
+                code: 'RECEIPT_NOT_FINALIZED',
+                message: BROADCAST_NOT_YET_FINAL,
+              },
+            },
+            // Retained, so the interrupted client can settle() later.
+            prepared,
+          };
+        }
+        // A finalized receipt that says the broadcast reverted. The transaction is
+        // real and its hash is known, so — as with any broadcast that produced a
+        // hash — the caller must be able to hand that hash to settle() rather than
+        // resend. But the *reason* matters more than the status here: a revert is
+        // settled evidence of a failed call, so the failure block carries the
+        // distinct SUBMISSION_REVERTED code and a message that says the submission
+        // itself failed. Reporting this as an ordinary "wait for finality" would
+        // tell the caller to keep waiting for a receipt that will never succeed.
+        if (error instanceof RunnerError && error.code === 'SUBMISSION_REVERTED') {
+          this.record('SUBMITTED', 'submitDelivery reverted on chain');
+          return {
+            evidence: {
+              status: 'SUBMITTED',
+              jobId: this.config.jobId,
+              job: evidence.job,
+              observation: evidence.observation,
+              transfer: prepared.transfer,
+              deliveryCommitment: prepared.commitment,
+              request: prepared.request,
+              transactionHash: sendOutcome.transactionHash,
+              steps: [...this.steps],
+              failure: { code: 'SUBMISSION_REVERTED', message: SUBMISSION_REVERTED_MESSAGE },
+            },
+            // Deliberately retained. The run is over and will never finalize, but
+            // the recovery handle still holds the only correct answer to "what was
+            // this job submitted with", which is what a caller reconciling history
+            // against on-chain state needs to resolve the revert.
+            prepared,
+          };
+        }
+        throw error;
+      }
       return {
         evidence: {
           status: 'FINALIZED',
@@ -462,6 +956,7 @@ export class ProviderRunner {
           submission: verified,
           deliveryCommitment: prepared.commitment,
           request: prepared.request,
+          transactionHash: sendOutcome.transactionHash,
           steps: [...this.steps],
         },
         prepared,
@@ -511,7 +1006,11 @@ export class ProviderRunner {
       };
     }
 
-    this.record('FAILED', `the signer refused: ${sendOutcome.reason}`);
+    // A signer reason is the signer's own sentence about the transaction it
+    // refused, and it can name a URL, an authorization header, or the payload
+    // it was handed. The step log records that the signer refused, which is the
+    // fact the protocol needs, and the reason stays with the signer's own logger.
+    this.record('FAILED', 'the signer refused the submitDelivery request');
     return {
       evidence: {
         status: 'FAILED',
@@ -522,13 +1021,45 @@ export class ProviderRunner {
         deliveryCommitment: prepared.commitment,
         request: prepared.request,
         steps: [...this.steps],
-        failure: { code: 'SEND_FAILED', message: sendOutcome.reason },
+        failure: { code: 'SEND_FAILED', message: SEND_REJECTED_MESSAGE },
       },
       prepared,
     };
   }
 
   // -- stage 1: select the job ---------------------------------------------
+
+  /**
+   * Reject a config whose token or requirement changed after construction.
+   *
+   * Called at the start of every public method, before private input, the
+   * executor, the transfer hook, or the signer. The comparison is the same
+   * case-insensitive address check the constructor used.
+   */
+  private recheckAcceptedTokens(): void {
+    const requirement = this.config.transfer?.requirement;
+    const planLocator = this.config.transfer?.observedTransactionHash;
+    const requirementLocator = requirement?.observedTransactionHash;
+    const locatorMoved = (current: Hex | undefined, accepted: Hex | undefined) =>
+      (current === undefined) !== (accepted === undefined) ||
+      (current !== undefined && accepted !== undefined && !sameHex(current, accepted));
+    if (
+      this.config.transfer !== this.acceptedTransfer ||
+      !requirement ||
+      !sameAddress(this.config.paymentToken, this.acceptedPaymentToken) ||
+      !sameAddress(requirement.token, this.acceptedRequirement.token) ||
+      !sameAddress(requirement.recipient, this.acceptedRequirement.recipient) ||
+      requirement.amountAtomic !== this.acceptedRequirement.amountAtomic ||
+      locatorMoved(requirementLocator, this.acceptedRequirement.observedTransactionHash) ||
+      locatorMoved(planLocator, this.acceptedPlanLocator) ||
+      this.config.transfer?.execute !== this.acceptedExecute
+    ) {
+      throw new RunnerError(
+        'TRANSFER_TOKEN_MISMATCH',
+        'the configured payment token and the required task transfer token do not agree'
+      );
+    }
+  }
 
   private async selectJob(): Promise<{
     job: JobData;
@@ -544,19 +1075,19 @@ export class ProviderRunner {
         this.config.jobId
       ));
     } catch (error) {
-      throw new RunnerError('JOB_READ_FAILED', messageOf(error));
+      throw readerFailure(error);
     }
 
     if (this.config.signer && !sameAddress(this.config.signer.address, job.provider)) {
       throw new RunnerError(
         'SIGNER_NOT_PROVIDER',
-        `signer ${this.config.signer.address} is not the job provider ${job.provider}`
+        SIGNER_NOT_PROVIDER_MESSAGE
       );
     }
     if (job.status === CANONICAL_JOB_STATUS.Proposed || job.status === CANONICAL_JOB_STATUS.Accepted) {
       throw new RunnerError(
         'JOB_NOT_FUNDED',
-        `job is ${jobStatusName(job.status)}; a provider runner can only submit a delivery for a funded job`
+        JOB_NOT_FUNDED_MESSAGE
       );
     }
     if (job.status === CANONICAL_JOB_STATUS.Submitted ||
@@ -566,17 +1097,17 @@ export class ProviderRunner {
         job.status === CANONICAL_JOB_STATUS.Cancelled) {
       throw new RunnerError(
         'JOB_ALREADY_SUBMITTED',
-        `job is ${jobStatusName(job.status)} with deliveryCommitment ${job.deliveryCommitment}; submitting again would revert`
+        JOB_NOT_SUBMITTABLE_MESSAGE
       );
     }
     if (!ZERO_WORD.test(job.deliveryCommitment)) {
       throw new RunnerError(
         'JOB_ALREADY_SUBMITTED',
-        `job already carries a non-zero deliveryCommitment ${job.deliveryCommitment}`
+        JOB_ALREADY_CARRIES_COMMITMENT_MESSAGE
       );
     }
 
-    this.record('SELECTED', `job ${this.config.jobId} is funded with provider ${job.provider}`);
+    this.record('SELECTED', `job ${this.config.jobId} is funded and ready to submit`);
     return { job, observation };
   }
 
@@ -586,7 +1117,15 @@ export class ProviderRunner {
     if (!this.config.privateInput || typeof this.config.privateInput.provide !== 'function') {
       throw new RunnerError('PRIVATE_INPUT_REQUIRED', 'a private input provider is required');
     }
-    const material = await this.config.privateInput.provide(toJobView(this.config.jobId, job));
+    // A provider that throws, rather than returning nothing, is a collaborator
+    // failure in its own terms. Its message describes what it was handed, so it
+    // is not relayed; the code says which collaborator failed.
+    let material: PrivateDeliveryMaterial;
+    try {
+      material = await this.config.privateInput.provide(toJobView(this.config.jobId, job));
+    } catch {
+      throw new RunnerError('PRIVATE_INPUT_INVALID', PRIVATE_INPUT_THROWN);
+    }
     if (!material || typeof material !== 'object') {
       throw new RunnerError('PRIVATE_INPUT_INVALID', 'the private input provider returned no material');
     }
@@ -600,14 +1139,25 @@ export class ProviderRunner {
     if (!this.config.executor || typeof this.config.executor.execute !== 'function') {
       throw new RunnerError('EXECUTION_FAILED', 'a task executor is required');
     }
-    const result: TaskExecutionResult = await this.config.executor.execute(
-      toJobView(this.config.jobId, job),
-      material
-    );
+    let result: TaskExecutionResult;
+    try {
+      result = await this.config.executor.execute(toJobView(this.config.jobId, job), material);
+    } catch {
+      // A thrown executor is the same collaborator failure as a returned one:
+      // it may quote the payload or the private input it was working on, so its
+      // message is dropped and the stable code carries the failure.
+      throw new RunnerError('EXECUTION_FAILED', EXECUTION_FAILURE_MESSAGE);
+    }
     if (!result || result.ok !== true) {
+      // A returned `reason` is the executor's own sentence about the work it just
+      // did, and it is written by whoever supplied the executor — which for this
+      // runner's threat model is not necessarily a friendly party. It can quote
+      // the payload, the private input, or the job it was handed. The code is the
+      // contract; the message says the executor declined, and the reason stays
+      // with the executor's own logger.
       throw new RunnerError(
         'EXECUTION_FAILED',
-        result && result.ok === false ? result.reason : 'the task executor returned no result'
+        result && result.ok === false ? EXECUTION_DECLINED_MESSAGE : 'the task executor returned no result'
       );
     }
     const delivery = result.delivery;
@@ -623,7 +1173,10 @@ export class ProviderRunner {
 
   // -- stage 3: task transfer and commitment binding ------------------------
 
-  private async settleTransfer(job: JobData): Promise<ObservedTransfer> {
+  private async settleTransfer(
+    job: JobData,
+    recoveredHash?: Hex
+  ): Promise<{ readonly transfer: ObservedTransfer; readonly observation: CanonicalFinalizedBlock }> {
     const requirement = this.config.transfer.requirement;
     const plan = this.config.transfer;
 
@@ -643,7 +1196,19 @@ export class ProviderRunner {
       );
     }
 
+    // Honouring a proven recovery hash over a config-supplied one is the point of
+    // the parameter: the caller who resumed this run may no longer have the same
+    // config it started with, and the hash is what was checked against the
+    // commitment. Only the first two lines of this method care where it came from;
+    // everything below re-derives the transfer's terms from chain state.
     let hash: Hex | undefined = plan.observedTransactionHash ?? requirement.observedTransactionHash;
+    if (recoveredHash !== undefined && !sameHex(hash ?? recoveredHash, recoveredHash)) {
+      throw new RunnerError(
+        'TRANSFER_NOT_OBSERVED',
+        'the observed transfer hash does not match the hash bound to the delivery commitment'
+      );
+    }
+    if (recoveredHash !== undefined) hash = recoveredHash;
     if (hash === undefined) {
       if (!plan.execute) {
         throw new RunnerError(
@@ -651,24 +1216,29 @@ export class ProviderRunner {
           'the task transfer was neither performed nor executable, so the required work cannot be proven'
         );
       }
-      hash = await plan.execute();
-    }
-    if (typeof hash !== 'string' || !HASH_RE.test(hash)) {
-      throw new RunnerError('TRANSFER_NOT_OBSERVED', 'the task transfer produced no 32-byte transaction hash');
+      let performed: Hex;
+      try {
+        performed = await plan.execute();
+      } catch {
+        // A transfer hook that throws is a collaborator failure whose message
+        // quotes the request it was about to send. The stable code reports the
+        // hook failed; the integrator's own log carries the detail.
+        throw new RunnerError('TRANSFER_PLAN_REQUIRED', TRANSFER_HOOK_THREW);
+      }
+      if (typeof performed !== 'string' || !HASH_RE.test(performed)) {
+        throw new RunnerError('TRANSFER_NOT_OBSERVED', 'the task transfer produced no 32-byte transaction hash');
+      }
+      hash = performed;
     }
 
     let settled: Awaited<ReturnType<typeof matchedFinalizedReceipt>>;
     try {
       settled = await matchedFinalizedReceipt(this.config.primary, this.config.secondary, hash);
     } catch (error) {
-      const text = messageOf(error);
-      throw new RunnerError(
-        text.includes('MISMATCH') ? 'TRANSFER_RPC_CONFLICT' : 'TRANSFER_NOT_FINALIZED',
-        text
-      );
+      throw receiptFailure(error, 'TRANSFER_RPC_CONFLICT', 'TRANSFER_NOT_FINALIZED', TRANSFER_NOT_USABLE_YET);
     }
     if (settled.receipt.status !== 'success') {
-      throw new RunnerError('TRANSFER_NOT_FINALIZED', `task transfer ${hash} reverted`);
+      throw new RunnerError('TRANSFER_NOT_FINALIZED', TRANSFER_REVERTED_MESSAGE);
     }
 
     // Decode EVERY token's Transfer logs, not only the required token's.
@@ -694,7 +1264,7 @@ export class ProviderRunner {
     if (!sameAddress(sender, job.provider)) {
       throw new RunnerError(
         'TRANSFER_MISMATCH',
-        `task transfer was sent by ${sender}, not the job provider ${job.provider}`
+        TRANSFER_SENDER_MISMATCH_MESSAGE
       );
     }
 
@@ -704,14 +1274,17 @@ export class ProviderRunner {
     // that actually moved is the required one, and reporting it back is the
     // observed fact rather than an echo of the config.
     return {
-      transactionHash: hash,
-      blockNumber: settled.receipt.blockNumber,
-      blockHash: settled.receipt.blockHash,
-      timestamp: settled.block.timestamp,
-      token: requirement.token,
-      sender,
-      recipient: requirement.recipient,
-      amountAtomic: requirement.amountAtomic,
+      transfer: {
+        transactionHash: hash,
+        blockNumber: settled.receipt.blockNumber,
+        blockHash: settled.receipt.blockHash,
+        timestamp: settled.block.timestamp,
+        token: requirement.token,
+        sender,
+        recipient: requirement.recipient,
+        amountAtomic: requirement.amountAtomic,
+      },
+      observation,
     };
   }
 
@@ -738,7 +1311,7 @@ export class ProviderRunner {
       // move the protocol payment token, its evidence is not the work.
       throw new RunnerError(
         'TRANSFER_MISMATCH',
-        `task transfer moved ${transfer.token}, but the protocol payment token is ${this.config.paymentToken}`
+        TRANSFER_TOKEN_DISAGREEMENT_MESSAGE
       );
     }
 
@@ -755,22 +1328,22 @@ export class ProviderRunner {
     try {
       validated = privateDeliverySchema.parse(delivery);
     } catch (error) {
-      throw new RunnerError('PRIVATE_INPUT_INVALID', `the assembled delivery payload is not canonical: ${messageOf(error)}`);
+      throw new RunnerError('PRIVATE_INPUT_INVALID', PAYLOAD_NOT_CANONICAL);
     }
 
     let salt: Hex;
     try {
       validateSalt(material.salt, 32);
       salt = material.salt;
-    } catch (error) {
-      throw new RunnerError('PRIVATE_INPUT_INVALID', messageOf(error));
+    } catch {
+      throw new RunnerError('PRIVATE_INPUT_INVALID', PREPARED_SALT_INVALID);
     }
 
     let commitment: Hex;
     try {
       commitment = createDeliveryCommitment(this.config.jobId, validated, salt).commitment;
-    } catch (error) {
-      throw new RunnerError('COMMITMENT_INVALID', messageOf(error));
+    } catch {
+      throw new RunnerError('COMMITMENT_INVALID', COMMITMENT_NOT_COMPUTABLE);
     }
     if (!HASH_RE.test(commitment) || ZERO_WORD.test(commitment)) {
       throw new RunnerError('COMMITMENT_INVALID', 'the computed delivery commitment is not a non-zero 32-byte value');
@@ -787,14 +1360,64 @@ export class ProviderRunner {
         this.config.addresses,
         this.config.chainId ?? MONAD_TESTNET_CHAIN_ID
       );
-    } catch (error) {
-      throw new RunnerError('REQUEST_INVALID', messageOf(error));
+    } catch {
+      throw new RunnerError('REQUEST_INVALID', REQUEST_NOT_BUILDABLE);
     }
 
-    return { delivery: validated, commitment, transfer, request, observation, job };
+    return { delivery: validated, commitment, salt, transfer, request, observation, job };
   }
 
   // -- stage 4/5: broadcast and verify --------------------------------------
+
+  /**
+   * Prove a recovery payload really produces the commitment on chain.
+   *
+   * This is the one place in the runner that checks a value it was handed by
+   * re-deriving a fact the protocol holds, rather than reading a subsequent one.
+   * A commitment is `hash(jobId, payload, salt)`, so two peaceful callers holding
+   * the same commitment are the only way a resumed run and the chain can be
+   * talking about the same delivery. Recomputing it and comparing is therefore
+   * the only check that distinguishes "the client that prepared this is handing
+   * back what it prepared" from "a client is asking the runner to vouch for a
+   * payload it never committed to".
+   *
+   * Why this matters: the payload binds the transfer locator, and the locator is
+   * what `settle()` uses to re-observe a transfer and re-issue its report. A
+   * payload that survives recomputation may be read; one that does not is
+   * refused, and nothing downstream of it runs.
+   *
+   * Why this is a recomputation and not a message check: the value being proven
+   * is caller-supplied, so there is no safe sentence to write about it. The
+   * comparison has no message to leak.
+   */
+  private provePayloadBindsCommitment(
+    commitment: Hex,
+    delivery: PrivateDeliveryInput,
+    salt: Hex | undefined
+  ): void {
+    if (salt === undefined) {
+      throw new RunnerError('PRIVATE_INPUT_INVALID', PREPARED_SALT_MISSING);
+    }
+    try {
+      validateSalt(salt, 32);
+    } catch {
+      // The salt, not the payload, is what is malformed here, and its value is
+      // the caller's: report that the salt is unusable without echoing it.
+      throw new RunnerError('PRIVATE_INPUT_INVALID', PREPARED_SALT_INVALID);
+    }
+    let recomputed: Hex;
+    try {
+      recomputed = createDeliveryCommitment(this.config.jobId, delivery, salt).commitment;
+    } catch {
+      // A payload that cannot be hashed at all is not the payload that was
+      // committed. The structural reason (a wrong field or schema version) is
+      // exactly what a caller probing the validator should not be handed.
+      throw new RunnerError('PRIVATE_INPUT_INVALID', PAYLOAD_NOT_CANONICAL);
+    }
+    if (recomputed.toLowerCase() !== commitment.toLowerCase()) {
+      throw new RunnerError('RECEIPT_COMMITMENT_MISMATCH', PAYLOAD_COMMITMENT_MISMATCH);
+    }
+  }
 
   private async verifySubmission(
     job: JobData,
@@ -806,19 +1429,15 @@ export class ProviderRunner {
     try {
       settled = await matchedFinalizedReceipt(this.config.primary, this.config.secondary, transactionHash);
     } catch (error) {
-      const text = messageOf(error);
-      throw new RunnerError(
-        text.includes('MISMATCH') ? 'RECEIPT_RPC_CONFLICT' : 'RECEIPT_NOT_FINALIZED',
-        text
-      );
+      throw receiptFailure(error, 'RECEIPT_RPC_CONFLICT', 'RECEIPT_NOT_FINALIZED', RECEIPT_NOT_USABLE_YET);
     }
     if (settled.receipt.status !== 'success') {
-      throw new RunnerError('SUBMISSION_REVERTED', `${request.functionName} reverted in ${transactionHash}`);
+      throw new RunnerError('SUBMISSION_REVERTED', SUBMISSION_REVERTED_MESSAGE);
     }
     if (!sameAddress(settled.receipt.to, this.config.addresses.protocol)) {
       throw new RunnerError(
         'RECEIPT_MISSING_EVENT',
-        `receipt ${transactionHash} targeted ${settled.receipt.to}, not the protocol ${this.config.addresses.protocol}`
+        RECEIPT_WRONG_TARGET_MESSAGE
       );
     }
 
@@ -846,13 +1465,13 @@ export class ProviderRunner {
     if (submissions.length === 0) {
       throw new RunnerError(
         'RECEIPT_MISSING_EVENT',
-        `receipt ${transactionHash} contains no DeliverySubmitted event from the protocol`
+        RECEIPT_NO_SUBMISSION_EVENT_MESSAGE
       );
     }
     if (submissions.length > 1) {
       throw new RunnerError(
         'RECEIPT_EVENT_AMBIGUOUS',
-        `receipt ${transactionHash} contains ${submissions.length} DeliverySubmitted events`
+        RECEIPT_SUBMISSION_EVENTS_AMBIGUOUS_MESSAGE
       );
     }
 
@@ -860,19 +1479,19 @@ export class ProviderRunner {
     if (args.jobId !== this.config.jobId) {
       throw new RunnerError(
         'RECEIPT_COMMITMENT_MISMATCH',
-        `receipt proves DeliverySubmitted for job ${args.jobId}, not ${this.config.jobId}`
+        RECEIPT_WRONG_JOB_MESSAGE
       );
     }
     if (!sameAddress(args.provider, request.from ?? job.provider)) {
       throw new RunnerError(
         'RECEIPT_COMMITMENT_MISMATCH',
-        `receipt proves the provider ${args.provider}, not ${job.provider}`
+        RECEIPT_WRONG_PROVIDER_MESSAGE
       );
     }
     if (args.deliveryCommitment.toLowerCase() !== expectedCommitment.toLowerCase()) {
       throw new RunnerError(
         'RECEIPT_COMMITMENT_MISMATCH',
-        `receipt proves deliveryCommitment ${args.deliveryCommitment}, not the prepared ${expectedCommitment}`
+        RECEIPT_WRONG_COMMITMENT_MESSAGE
       );
     }
 
@@ -898,26 +1517,27 @@ export class ProviderRunner {
         minedBlock
       );
     } catch (error) {
-      throw new RunnerError(
-        messageOf(error).includes('RPC_STATE_MISMATCH') ? 'RECEIPT_RPC_CONFLICT' : 'JOB_READ_FAILED',
-        messageOf(error)
-      );
+      // The readers are caller-injected, so their transport errors can embed an
+      // RPC endpoint URL, an API key, or a request body. The sentinel string is
+      // what classifies the failure; the message is runner-authored, keyed only
+      // to whether the two readers conflicted.
+      throw readerFailure(error);
     }
     if (observedJob.status !== CANONICAL_JOB_STATUS.Submitted) {
       throw new RunnerError(
         'RECEIPT_MISSING_EVENT',
-        `job ${this.config.jobId} reads status ${jobStatusName(observedJob.status)} at block ${minedBlock}`
+        RECEIPT_STORAGE_NOT_REFLECTED_MESSAGE
       );
     }
     if (observedJob.deliveryCommitment.toLowerCase() !== expectedCommitment.toLowerCase()) {
       throw new RunnerError(
         'RECEIPT_COMMITMENT_MISMATCH',
-        `job ${this.config.jobId} carries deliveryCommitment ${observedJob.deliveryCommitment}`
+        RECEIPT_STORAGE_COMMITMENT_MISMATCH_MESSAGE
       );
     }
 
     const observation = await this.finalizedHead();
-    this.record('FINALIZED', `DeliverySubmitted observed in block ${minedBlock} (${minedHash})`);
+    this.record('FINALIZED', 'DeliverySubmitted observed in a finalized block agreed by both readers');
     return {
       transactionHash,
       blockNumber: settled.receipt.blockNumber,
@@ -965,30 +1585,30 @@ export class ProviderRunner {
       if (wrongRecipient.length > 0) {
         return new RunnerError(
           'TRANSFER_MISMATCH',
-          `receipt ${hash} sent ${requirement.amountAtomic} of the protocol token to ${wrongRecipient[0]!.to}, not the required recipient ${requirement.recipient}`
+          TRANSFER_WRONG_RECIPIENT_MESSAGE
         );
       }
       if (wrongAmount.length > 0) {
         return new RunnerError(
           'TRANSFER_NOT_OBSERVED',
-          `receipt ${hash} moved ${wrongAmount[0]!.value} of the protocol token, not the required ${requirement.amountAtomic}`
+          TRANSFER_WRONG_AMOUNT_MESSAGE
         );
       }
       if (decoded.length > 0) {
         const moved = decoded[0]!;
         return new RunnerError(
           'TRANSFER_TOKEN_MISMATCH',
-          `receipt ${hash} moved ${moved.value} of ${moved.token}, not the protocol payment token ${requirement.token}`
+          TRANSFER_TOKEN_DISAGREEMENT_MESSAGE
         );
       }
       return new RunnerError(
         'TRANSFER_NOT_OBSERVED',
-        `receipt ${hash} carries no Transfer log at all, so the required work is unproven`
+        TRANSFER_NO_LOG_MESSAGE
       );
     }
     return new RunnerError(
       'TRANSFER_MISMATCH',
-      `receipt ${hash} carries ${count} transfers that each satisfy the terms, so the one required payment is ambiguous`
+      TRANSFER_AMBIGUOUS_MESSAGE
     );
   }
 
@@ -996,7 +1616,7 @@ export class ProviderRunner {
     try {
       return await matchedFinalizedHeadHere(this.config.primary, this.config.secondary);
     } catch (error) {
-      throw new RunnerError('RECEIPT_RPC_CONFLICT', messageOf(error));
+      throw new RunnerError('RECEIPT_RPC_CONFLICT', FINALITY_MISMATCH);
     }
   }
 
@@ -1148,6 +1768,42 @@ function toJobView(jobId: bigint, job: JobData): ProviderJobView {
 function jobStatusName(status: number): string {
   const entry = Object.entries(CANONICAL_JOB_STATUS).find(([, value]) => value === status);
   return entry ? entry[0] : `status ${status}`;
+}
+
+/**
+ * Turn a reader failure into a runner-authored error, classified only by its
+ * sentinel.
+ *
+ * The readers are injected by the caller, so their errors are not this module's
+ * text: a transport failure can carry an endpoint URL, an API key, or a request
+ * body. The sentinel string is the only part that is safe to branch on, because
+ * it is produced by `canonical-chain` rather than by the reader. The message is
+ * one of two runner literals, chosen by that sentinel and nothing else.
+ */
+function readerFailure(error: unknown): RunnerError {
+  return messageOf(error).includes('RPC_STATE_MISMATCH')
+    ? new RunnerError('RECEIPT_RPC_CONFLICT', READERS_DISAGREE)
+    : new RunnerError('JOB_READ_FAILED', READ_JOB_NOT_AVAILABLE);
+}
+
+/**
+ * Turn a receipt or transfer reader failure into a runner-authored error.
+ *
+ * Same reasoning as `readerFailure`: the sentinel decides between "the two
+ * readers conflict" and "this one transaction is not usable yet", and the
+ * message is the runner's own literal rather than the reader's transport text.
+ * The caller supplies the pair of codes and the not-yet-final message because
+ * a task transfer and a submission receipt are different facts.
+ */
+function receiptFailure(
+  error: unknown,
+  conflict: RunFailureCode,
+  pending: RunFailureCode,
+  pendingMessage: string
+): RunnerError {
+  return messageOf(error).includes('MISMATCH')
+    ? new RunnerError(conflict, FINALITY_MISMATCH)
+    : new RunnerError(pending, pendingMessage);
 }
 
 function validateTransferRequirement(requirement: TaskTransferRequirement): void {

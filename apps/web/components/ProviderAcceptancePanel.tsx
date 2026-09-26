@@ -20,17 +20,21 @@ import {
   buildAcceptRequest,
   buildSubmitRequest,
   type ContractAddresses,
+  type ContractRequest,
 } from '../../../packages/monad/src/delivery-chain';
 import {
   generateSalt,
   validateSalt,
 } from '../../../packages/monad/src/commitments';
+import { ProviderRunner } from '../../../packages/monad/src/provider-runner/runner';
+import type { ProviderSigner } from '../../../packages/monad/src/provider-runner/adapters';
 import { StatusBadge, SectionCard, FieldPreview, DisabledNotice, ErrorSummary, ExplorerLink } from '../components/StatusBadge';
 import type { StatusState } from '../components/StatusBadge';
 import { useConfig } from '../hooks/useConfig';
 import { useTx } from '../hooks/useTx';
 import { createMonadClient } from '../../../packages/monad/src/delivery-chain';
-import { matchedCanonicalJob, matchedFinalizedReceipt, viemPublicClientToCanonicalChainReader } from '../../../packages/monad/src/canonical-chain';
+import { matchedCanonicalJob, matchedFinalizedReceipt, viemPublicClientToCanonicalChainReader, type CanonicalChainReader } from '../../../packages/monad/src/canonical-chain';
+import type { XYXConfig } from '../../../packages/monad/src/config';
 import type { JobData } from '../../../packages/monad/src/protocol';
 import { deliveryProtocolAbi } from '../../../packages/monad/src/protocol';
 import { tokenTransfers } from '../../../packages/monad/src/chain-primitives';
@@ -45,6 +49,146 @@ const transferAbi = [{ type: 'event', name: 'Transfer', inputs: [
 ] }, { type: 'function', name: 'transfer', inputs: [
   { name: 'to', type: 'address' }, { name: 'value', type: 'uint256' },
 ], outputs: [{ name: '', type: 'bool' }], stateMutability: 'nonpayable' }] as const;
+
+export interface ProviderRunnerSdkDeliveryParams {
+  jobId: bigint;
+  config: XYXConfig;
+  providerAddress: Address;
+  deliveryBundle: PrivateDeliveryBundle;
+  transferHash: Hex;
+  termsBundle: PrivateTermsBundle;
+  primaryReader?: CanonicalChainReader;
+  secondaryReader?: CanonicalChainReader;
+  signer?: ProviderSigner;
+  onWalletPrompt?: () => void;
+  onSubmitted?: (hash: Hex) => void;
+}
+
+export interface ProviderRunnerSdkDeliveryResult {
+  status: 'FINALIZED' | 'SUBMITTED' | 'FAILED';
+  submissionHash?: Hex;
+  observedJob?: JobData;
+  updatedBundle?: PrivateDeliveryBundle;
+  receiptBlock?: bigint;
+  failureCode?: string;
+  failureMessage?: string;
+}
+
+export async function executeProviderRunnerSdkDelivery(
+  params: ProviderRunnerSdkDeliveryParams
+): Promise<ProviderRunnerSdkDeliveryResult> {
+  const {
+    jobId,
+    config,
+    providerAddress,
+    deliveryBundle,
+    transferHash,
+    termsBundle,
+    onWalletPrompt,
+    onSubmitted,
+  } = params;
+
+  if (!config.paymentTokenAddress) throw new Error('PAYMENT_TOKEN_ADDRESS_MISSING');
+  if (!config.secondaryRpcUrl) throw new Error('SECONDARY_RPC_URL_MISSING');
+
+  // Verify that the delivery bundle has a valid 32-byte salt and matching commitment
+  validateSalt(deliveryBundle.salt, 32);
+  const expectedCommitment = createDeliveryCommitment(jobId, deliveryBundle.delivery, deliveryBundle.salt).commitment;
+  if (expectedCommitment.toLowerCase() !== deliveryBundle.commitment.toLowerCase()) {
+    throw new Error('DELIVERY_BUNDLE_COMMITMENT_INVALID');
+  }
+
+  const primary = params.primaryReader ?? viemPublicClientToCanonicalChainReader(createMonadClient(config.rpcUrl));
+  const secondary = params.secondaryReader ?? viemPublicClientToCanonicalChainReader(createMonadClient(config.secondaryRpcUrl));
+
+  const signer = params.signer ?? {
+    address: providerAddress,
+    sendTransaction: async (req: ContractRequest) => {
+      const outcome = await executeBrowserTransaction(config, req, `submit:${jobId}`, {
+        onWalletPrompt,
+        onSubmitted,
+      });
+      if (outcome.status === 'finalized' || outcome.status === 'pending') {
+        return { kind: 'submitted', transactionHash: outcome.hash };
+      }
+      return { kind: 'rejected', reason: 'REVERTED' };
+    },
+  };
+
+  const { recipient, amountAtomic } = taskTransferFromTerms(termsBundle.terms);
+
+  const runner = new ProviderRunner({
+    jobId,
+    addresses: {
+      protocol: config.protocolAddress,
+      registry: config.registryAddress,
+      p256Verifier: config.p256VerifierAddress,
+      paymentToken: config.paymentTokenAddress,
+    },
+    paymentToken: config.paymentTokenAddress,
+    primary,
+    secondary,
+    signer,
+    privateInput: {
+      provide: async () => ({
+        schema: deliveryBundle.delivery.schema,
+        kind: deliveryBundle.delivery.kind,
+        content: deliveryBundle.delivery.content,
+        salt: deliveryBundle.salt, // EXACT salt from delivery bundle, NEVER generate a second salt!
+      }),
+    },
+    executor: {
+      execute: async (_jobView, input) => ({ ok: true, delivery: input.content }),
+    },
+    transfer: {
+      requirement: {
+        recipient,
+        amountAtomic,
+        token: config.paymentTokenAddress,
+      },
+      observedTransactionHash: deliveryBundle.transferTx ?? transferHash,
+    },
+  });
+
+  const outcome = await runner.run();
+  if (outcome.evidence.status === 'FINALIZED') {
+    const observed = await matchedCanonicalJob(primary, secondary, config.protocolAddress, jobId);
+    if (observed.job.status !== 3 || observed.job.deliveryCommitment.toLowerCase() !== deliveryBundle.commitment.toLowerCase()) {
+      throw new Error('DELIVERY_COMMITMENT_MISMATCH');
+    }
+    const subTx = (outcome.evidence.submission?.transactionHash ?? outcome.evidence.transactionHash) as Hex | undefined;
+    if (!subTx) {
+      throw new Error('SUBMISSION_HASH_MISSING');
+    }
+    const receiptResult = await matchedFinalizedReceipt(primary, secondary, subTx);
+    if (receiptResult.receipt.status !== 'success') {
+      throw new Error('DELIVERY_SUBMISSION_REVERTED');
+    }
+    const updatedBundle: PrivateDeliveryBundle = {
+      ...deliveryBundle,
+      submissionTx: subTx,
+    };
+    return {
+      status: 'FINALIZED',
+      submissionHash: subTx,
+      observedJob: observed.job,
+      updatedBundle,
+      receiptBlock: receiptResult.receipt.blockNumber,
+    };
+  } else if (outcome.evidence.status === 'SUBMITTED') {
+    const subTx = (outcome.evidence.submission?.transactionHash ?? outcome.evidence.transactionHash) as Hex | undefined;
+    return {
+      status: 'SUBMITTED',
+      submissionHash: subTx,
+    };
+  } else {
+    return {
+      status: 'FAILED',
+      failureCode: outcome.evidence.failure?.code ?? 'RUNNER_FAILED',
+      failureMessage: outcome.evidence.failure?.message ?? 'RUNNER_FAILED',
+    };
+  }
+}
 
 export default function ProviderAcceptancePanel() {
   const { config, isReady } = useConfig();
@@ -313,6 +457,42 @@ export default function ProviderAcceptancePanel() {
     }
   }, [config, isReady, job, jobId, deliveryCommitment, deliveryBundle, transferHash, termsBundle, tx]);
 
+  const handleRunWithSdk = useCallback(async () => {
+    if (!config?.paymentTokenAddress || !config.secondaryRpcUrl || !job || !termsBundle || !transferHash || !deliveryBundle || !deliveryCommitment || exportedDeliveryCommitment !== deliveryCommitment) return;
+    setDeliveryError(null);
+    tx.reset();
+    try {
+      const result = await executeProviderRunnerSdkDelivery({
+        jobId: BigInt(jobId),
+        config,
+        providerAddress: job.provider,
+        deliveryBundle,
+        transferHash: transferHash as Hex,
+        termsBundle,
+        onWalletPrompt: tx.toPrompt,
+        onSubmitted: tx.toSubmitted,
+      });
+
+      if (result.status === 'FINALIZED') {
+        if (result.observedJob) setJob(result.observedJob);
+        if (result.updatedBundle) setDeliveryBundle(result.updatedBundle);
+        setDeliveryHandoffLink(null);
+        tx.toFinalized({ blockNumber: result.receiptBlock ?? 0n, status: 'success' });
+      } else if (result.status === 'SUBMITTED') {
+        if (result.submissionHash) tx.toSubmitted(result.submissionHash);
+      } else {
+        tx.toFailed(result.failureCode ?? 'RUNNER_FAILED');
+        setDeliveryError(result.failureMessage ?? 'RUNNER_FAILED');
+      }
+    } catch (e) {
+      const code = e instanceof Error ? e.message : 'RUNNER_FAILED';
+      if (code === 'USER_REJECTED') tx.toCancelled();
+      else if (code.startsWith('RPC_') || code.startsWith('OPERATION_') || code.startsWith('SUBMISSION_UNCERTAIN') || code.includes('MISMATCH')) tx.toConflict(code);
+      else tx.toFailed(code);
+      setDeliveryError(code);
+    }
+  }, [config, job, termsBundle, transferHash, deliveryBundle, deliveryCommitment, exportedDeliveryCommitment, jobId, tx]);
+
   const isSubmitting = ['submitted', 'pending_finality', 'browser_prompt'].includes(tx.state);
   const statusState: StatusState = !isReady()
     ? 'CONFIGURATION_REQUIRED'
@@ -519,6 +699,19 @@ export default function ProviderAcceptancePanel() {
                     }}
                   >
                     {isSubmitting ? 'Submitting...' : 'Submit delivery commitment'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleRunWithSdk}
+                    disabled={!canSubmit || isSubmitting}
+                    style={{
+                      padding: '10px 22px', borderRadius: 8, border: '1px solid #334337', marginTop: 16, marginLeft: 12,
+                      background: canSubmit && !isSubmitting ? '#1a2e22' : '#15251c',
+                      color: canSubmit && !isSubmitting ? '#bcfa73' : '#5a6e5e',
+                      fontWeight: 600, cursor: canSubmit && !isSubmitting ? 'pointer' : 'not-allowed', fontSize: 14,
+                    }}
+                  >
+                    {isSubmitting ? 'Running SDK...' : 'Submit via Provider Runner SDK'}
                   </button>
                   {tx.state !== 'idle' && (
                     <div style={{ marginTop: 12 }}>

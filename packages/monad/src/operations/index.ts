@@ -51,6 +51,7 @@ export type {
   NewOperationInput,
   OperationActorRole,
   OperationDeploymentBinding,
+  OperationDeploymentBindingInput,
   OperationFinalityObservation,
   OperationKind,
   OperationFailureCode,

@@ -33,6 +33,7 @@
  * @module @xyx/monad/operations
  */
 
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -40,6 +41,7 @@ import { DatabaseSync } from 'node:sqlite';
 import {
   assertNoSecrets,
   nextOperationStatus,
+  sameDeploymentBinding,
   type NewOperationInput,
   type OperationDeploymentBinding,
   type OperationError,
@@ -49,11 +51,46 @@ import {
   type OperationStatus,
   type ReceiptObservation,
   type ReconciliationResult,
+  validateActorRole,
+  validateChainId,
+  validateDeploymentBinding,
+  validateIdempotencyKey,
+  validateIntentDigest,
+  validateNonce,
+  validateOperationAddress,
+  validateOperationKind,
   validateTransactionHash,
 } from './types';
 
 /** Every path separator and every memory marker we refuse. */
 const IN_MEMORY_MARKERS = new Set(['', ':memory:', 'memory']);
+
+function validateAndCheckNewOperationInput(input: NewOperationInput): void {
+  assertNoSecrets(input);
+  validateIdempotencyKey(input.idempotencyKey);
+  validateOperationKind(input.kind);
+  validateOperationAddress(input.actor);
+  validateActorRole(input.actorRole);
+  validateChainId(input.expectedChainId);
+  validateDeploymentBinding(input.deployment);
+  validateIntentDigest(input.intentDigest);
+  if (input.nonce !== undefined && input.nonce !== null) {
+    validateNonce(input.nonce);
+  }
+}
+
+function matchesOperation(existing: OperationRecord, input: NewOperationInput): boolean {
+  return (
+    existing.kind === input.kind &&
+    existing.actor.toLowerCase() === input.actor.toLowerCase() &&
+    existing.actorRole === input.actorRole &&
+    existing.expectedChainId === input.expectedChainId &&
+    sameDeploymentBinding(existing.deployment, input.deployment) &&
+    existing.intentDigest.toLowerCase() === input.intentDigest.toLowerCase() &&
+    (existing.jobId ?? null) === (input.jobId ?? null) &&
+    (existing.nonce ?? null) === (input.nonce ?? null)
+  );
+}
 
 export class OperationStoreError extends Error {
   readonly code: OperationFailureCode;
@@ -102,6 +139,10 @@ export interface OperationJournal {
   claimSignerLease(lease: SignerLeaseRequest): SignerLease;
   /** Release a lease this holder owns. */
   releaseSignerLease(leaseId: string, holder: string): void;
+  /** Store a hashed capability token for an operation. The raw token is never stored. */
+  saveCapabilityHash(id: string, capabilityHash: string): void;
+  /** Verify a provided raw capability token against the stored capability hash in constant time. */
+  verifyCapability(id: string, rawCapability: string): boolean;
   /** Close the store. */
   close(): void;
 }
@@ -247,6 +288,11 @@ const SCHEMA_SQL = `
     expires_at INTEGER NOT NULL,
     UNIQUE (signer, nonce)
   ) STRICT;
+  CREATE TABLE IF NOT EXISTS operation_capabilities (
+    operation_id TEXT PRIMARY KEY,
+    capability_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  ) STRICT;
 `;
 
 /**
@@ -288,14 +334,19 @@ export class SqliteOperationStore implements OperationJournal {
   }
 
   create(input: NewOperationInput): OperationRecord {
-    assertNoSecrets(input);
+    validateAndCheckNewOperationInput(input);
     const now = Math.floor(Date.now() / 1000);
     // Duplicate idempotency keys must return the original operation and must
-    // never create a second one. The uniqueness constraint makes a second
-    // insert impossible; this check makes the *response* the original record,
-    // which is what a caller needs to make retries safe.
+    // never create a second one. Conflicting reuse of a key is rejected
+    // deterministically.
     const existing = this.findByIdempotencyKey(input.idempotencyKey);
-    if (existing) return existing;
+    if (existing) {
+      if (matchesOperation(existing, input)) return existing;
+      throw new OperationStoreError(
+        'IDEMPOTENCY_KEY_CONFLICT',
+        `an operation with idempotency key ${input.idempotencyKey} already exists with different parameters`
+      );
+    }
 
     const record: OperationRecord = {
       schema: 'xyx.monad.operation.v1',
@@ -432,6 +483,14 @@ export class SqliteOperationStore implements OperationJournal {
     // `nextOperationStatus` is the single authority: an illegal step throws
     // here and leaves the row untouched.
     const next = nextOperationStatus(current, to);
+    if (to === 'FINALIZED') {
+      if (!row.transaction_hash || !/^0x[0-9a-fA-F]{64}$/.test(row.transaction_hash)) {
+        throw new OperationStoreError(
+          'TRANSACTION_HASH_REQUIRED',
+          `operation ${id} cannot be FINALIZED without a recorded transaction hash`
+        );
+      }
+    }
     const now = Math.floor(Date.now() / 1000);
     const jobId = detail.jobId ?? row.job_id;
     this.database
@@ -490,7 +549,10 @@ export class SqliteOperationStore implements OperationJournal {
         observations.find(o => o.source === 'primary') as ReceiptObservation,
         observations.find(o => o.source === 'secondary') as ReceiptObservation,
       ];
-      const agreed = first.status === second.status
+      const hasHash = Boolean(row.transaction_hash && /^0x[0-9a-fA-F]{64}$/.test(row.transaction_hash));
+      const agreed = hasHash
+        && first.status === 'success'
+        && second.status === 'success'
         && first.blockHash === second.blockHash
         && first.blockNumber === second.blockNumber
         && first.rpc !== second.rpc;
@@ -506,6 +568,7 @@ export class SqliteOperationStore implements OperationJournal {
   }
 
   fail(id: string, code: OperationFailureCode, diagnostic: string): OperationRecord {
+    assertNoSecrets({ diagnostic });
     return this.transition(id, 'FAILED', { failureCode: code, diagnostic });
   }
 
@@ -517,6 +580,7 @@ export class SqliteOperationStore implements OperationJournal {
    * `FINALIZED` or `FAILED`, never back to something that looks automatic.
    */
   resolveAmbiguous(id: string, outcome: OperationStatus, diagnostic: string): OperationRecord {
+    assertNoSecrets({ diagnostic });
     if (outcome !== 'FINALIZED' && outcome !== 'FAILED') {
       throw new OperationStoreError(
         'OPERATION_TRANSITION_INVALID',
@@ -562,9 +626,28 @@ export class SqliteOperationStore implements OperationJournal {
     // cannot interleave with a competing claim.
     this.write(() => {
       this.database.prepare('DELETE FROM signer_leases WHERE expires_at <= ?').run(now);
-      this.database
-        .prepare('INSERT INTO signer_leases (lease_id, signer, nonce, holder, expires_at) VALUES (?, ?, ?, ?, ?)')
-        .run(leaseId, request.signer, request.nonce, request.holder, expiresAt);
+      const existing = request.nonce === null || request.nonce === undefined
+        ? this.database.prepare('SELECT * FROM signer_leases WHERE signer = ? AND nonce IS NULL').get(request.signer)
+        : this.database.prepare('SELECT * FROM signer_leases WHERE signer = ? AND nonce = ?').get(request.signer, request.nonce);
+      if (existing) {
+        throw new OperationStoreError(
+          'SIGNER_BUSY',
+          `signer ${request.signer} nonce ${request.nonce ?? 'auto'} is leased`
+        );
+      }
+      try {
+        this.database
+          .prepare('INSERT INTO signer_leases (lease_id, signer, nonce, holder, expires_at) VALUES (?, ?, ?, ?, ?)')
+          .run(leaseId, request.signer, request.nonce ?? null, request.holder, expiresAt);
+      } catch (err: unknown) {
+        if (err instanceof Error && err.message.includes('UNIQUE constraint')) {
+          throw new OperationStoreError(
+            'SIGNER_BUSY',
+            `signer ${request.signer} nonce ${request.nonce ?? 'auto'} is leased`
+          );
+        }
+        throw err;
+      }
     });
     return { leaseId, signer: request.signer, nonce: request.nonce, holder: request.holder, expiresAt };
   }
@@ -573,6 +656,39 @@ export class SqliteOperationStore implements OperationJournal {
     this.write(() => {
       this.database.prepare('DELETE FROM signer_leases WHERE lease_id = ? AND holder = ?').run(leaseId, holder);
     });
+  }
+
+  saveCapabilityHash(id: string, capabilityHash: string): void {
+    assertNoSecrets({ capabilityHash });
+    if (!/^[a-fA-F0-9]{64}$/.test(capabilityHash)) {
+      throw new OperationStoreError('OPERATION_ID_INVALID', 'capability hash must be a 32-byte hex string');
+    }
+    this.require(id);
+    const now = Math.floor(Date.now() / 1000);
+    this.write(() => {
+      this.database
+        .prepare(
+          'INSERT OR REPLACE INTO operation_capabilities (operation_id, capability_hash, created_at) VALUES (?, ?, ?)'
+        )
+        .run(id, capabilityHash.toLowerCase(), now);
+    });
+  }
+
+  verifyCapability(id: string, rawCapability: string): boolean {
+    if (typeof rawCapability !== 'string' || !rawCapability.trim()) return false;
+    const row = this.database
+      .prepare('SELECT capability_hash FROM operation_capabilities WHERE operation_id = ?')
+      .get(id) as { capability_hash: string } | undefined;
+    if (!row || !row.capability_hash) return false;
+    const computedHash = createHash('sha256').update(rawCapability).digest('hex');
+    try {
+      const a = Buffer.from(row.capability_hash, 'hex');
+      const b = Buffer.from(computedHash, 'hex');
+      if (a.length !== b.length) return false;
+      return timingSafeEqual(a, b);
+    } catch {
+      return false;
+    }
   }
 
   close(): void {
@@ -597,11 +713,18 @@ export class InMemoryOperationStore implements OperationJournal {
   private readonly records = new Map<string, OperationRecord>();
   private readonly byKey = new Map<string, string>();
   private readonly leases = new Map<string, SignerLease>();
+  private readonly capabilities = new Map<string, string>();
 
   create(input: NewOperationInput): OperationRecord {
-    assertNoSecrets(input);
+    validateAndCheckNewOperationInput(input);
     const existing = this.findByIdempotencyKey(input.idempotencyKey);
-    if (existing) return existing;
+    if (existing) {
+      if (matchesOperation(existing, input)) return existing;
+      throw new OperationStoreError(
+        'IDEMPOTENCY_KEY_CONFLICT',
+        `an operation with idempotency key ${input.idempotencyKey} already exists with different parameters`
+      );
+    }
     const now = Math.floor(Date.now() / 1000);
     const record: OperationRecord = {
       schema: 'xyx.monad.operation.v1',
@@ -643,6 +766,7 @@ export class InMemoryOperationStore implements OperationJournal {
   }
 
   transition(id: string, to: OperationStatus, detail: TransitionDetail = {}): OperationRecord {
+    assertNoSecrets(detail);
     const record = this.records.get(id);
     if (!record) throw new OperationStoreError('OPERATION_NOT_FOUND', `no operation with id ${id} exists`);
     // Same ordering as the SQLite store: a finished operation must say it is
@@ -651,6 +775,14 @@ export class InMemoryOperationStore implements OperationJournal {
       throw new OperationStoreError('OPERATION_ALREADY_FINALIZED', `operation ${id} is FINALIZED`);
     }
     const next = nextOperationStatus(record.status, to);
+    if (to === 'FINALIZED') {
+      if (!record.transactionHash || !/^0x[0-9a-fA-F]{64}$/.test(record.transactionHash)) {
+        throw new OperationStoreError(
+          'TRANSACTION_HASH_REQUIRED',
+          `operation ${id} cannot be FINALIZED without a recorded transaction hash`
+        );
+      }
+    }
     const updated: OperationRecord = {
       ...record,
       status: next,
@@ -691,9 +823,12 @@ export class InMemoryOperationStore implements OperationJournal {
     const secondary = observations.find(o => o.source === 'secondary');
     let reconciliation: ReconciliationResult;
     if (primary && secondary) {
-      const agreeing = primary.blockHash === secondary.blockHash
+      const hasHash = Boolean(record.transactionHash && /^0x[0-9a-fA-F]{64}$/.test(record.transactionHash));
+      const agreeing = hasHash
+        && primary.status === 'success'
+        && secondary.status === 'success'
+        && primary.blockHash === secondary.blockHash
         && primary.blockNumber === secondary.blockNumber
-        && primary.status === secondary.status
         && primary.rpc !== secondary.rpc;
       reconciliation = agreeing ? 'AGREED' : 'DISAGREED';
     } else {
@@ -703,10 +838,12 @@ export class InMemoryOperationStore implements OperationJournal {
   }
 
   fail(id: string, code: OperationFailureCode, diagnostic: string): OperationRecord {
+    assertNoSecrets({ diagnostic });
     return this.transition(id, 'FAILED', { failureCode: code, diagnostic });
   }
 
   resolveAmbiguous(id: string, outcome: OperationStatus, diagnostic: string): OperationRecord {
+    assertNoSecrets({ diagnostic });
     if (outcome !== 'FINALIZED' && outcome !== 'FAILED') {
       throw new OperationStoreError('OPERATION_TRANSITION_INVALID', `AMBIGUOUS may only resolve to FINALIZED or FAILED`);
     }
@@ -726,7 +863,9 @@ export class InMemoryOperationStore implements OperationJournal {
   }
 
   claimSignerLease(request: SignerLeaseRequest): SignerLease {
+    assertNoSecrets(request);
     const now = Math.floor(Date.now() / 1000);
+    if (request.ttlSeconds <= 0) throw new OperationStoreError('LEASE_NOT_HELD', 'a lease ttl must be positive');
     for (const lease of this.leases.values()) {
       if (lease.expiresAt <= now) this.leases.delete(lease.leaseId);
     }
@@ -751,10 +890,35 @@ export class InMemoryOperationStore implements OperationJournal {
     if (lease && lease.holder === holder) this.leases.delete(leaseId);
   }
 
+  saveCapabilityHash(id: string, capabilityHash: string): void {
+    assertNoSecrets({ capabilityHash });
+    if (!/^[a-fA-F0-9]{64}$/.test(capabilityHash)) {
+      throw new OperationStoreError('OPERATION_ID_INVALID', 'capability hash must be a 32-byte hex string');
+    }
+    if (!this.records.has(id)) throw new OperationStoreError('OPERATION_NOT_FOUND', `no operation with id ${id} exists`);
+    this.capabilities.set(id, capabilityHash.toLowerCase());
+  }
+
+  verifyCapability(id: string, rawCapability: string): boolean {
+    if (typeof rawCapability !== 'string' || !rawCapability.trim()) return false;
+    const stored = this.capabilities.get(id);
+    if (!stored) return false;
+    const computedHash = createHash('sha256').update(rawCapability).digest('hex');
+    try {
+      const a = Buffer.from(stored, 'hex');
+      const b = Buffer.from(computedHash, 'hex');
+      if (a.length !== b.length) return false;
+      return timingSafeEqual(a, b);
+    } catch {
+      return false;
+    }
+  }
+
   close(): void {
     this.records.clear();
     this.byKey.clear();
     this.leases.clear();
+    this.capabilities.clear();
   }
 
   private commit(id: string, patch: Partial<OperationRecord>): OperationRecord {

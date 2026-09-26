@@ -49,6 +49,13 @@ import {
   type OperationRecord,
 } from '../src/operations/index';
 
+import { GET as getOperationsRoute, POST as createOperationRoute } from '../../../apps/web/app/api/operations/route';
+import { GET as getOperationByIdRoute, PATCH as updateOperationByIdRoute } from '../../../apps/web/app/api/operations/[id]/route';
+import {
+  OPERATIONS_DB_PATH_ENV,
+  resetOperationJournal,
+} from '../../../apps/web/lib/server/operations/journal';
+
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
@@ -160,10 +167,22 @@ describe('request bodies are validated before anything else runs', () => {
     );
     assert.throws(
       () => assertNoSecrets({ 'PRIVATE-KEY': 'x' }),
-      (e: unknown) => e instanceof OperationError && e.code === 'SECRET_SHASHED_INPUT_REJECTED' || e.code === 'SECRET_SHAPED_INPUT_REJECTED'
+      (e: unknown) => e instanceof OperationError && (e.code === 'SECRET_SHAPED_INPUT_REJECTED' || e.code === 'SECRET_SHASHED_INPUT_REJECTED')
     );
     assert.throws(
       () => assertNoSecrets({ passkey: { id: 'x' } }),
+      (e: unknown) => e instanceof OperationError && e.code === 'SECRET_SHAPED_INPUT_REJECTED'
+    );
+    assert.throws(
+      () => assertNoSecrets({ signedPayload: '0x1234' }),
+      (e: unknown) => e instanceof OperationError && e.code === 'SECRET_SHAPED_INPUT_REJECTED'
+    );
+    assert.throws(
+      () => assertNoSecrets({ rawPrivateTerms: 'confidential' }),
+      (e: unknown) => e instanceof OperationError && e.code === 'SECRET_SHAPED_INPUT_REJECTED'
+    );
+    assert.throws(
+      () => assertNoSecrets({ rawPrivateEvidence: 'secret-evidence' }),
       (e: unknown) => e instanceof OperationError && e.code === 'SECRET_SHAPED_INPUT_REJECTED'
     );
   });
@@ -410,6 +429,47 @@ describe('the journal enforces the transition table on every write', () => {
       (e: unknown) => e instanceof OperationStoreError && e.code === 'OPERATION_NOT_FOUND'
     );
   });
+
+  it('rejects conflicting reuse of an idempotency key with different parameters', () => {
+    const store = new InMemoryOperationStore();
+    store.create(NO_JOB_OP);
+
+    // Different actor
+    assert.throws(
+      () => store.create({ ...NO_JOB_OP, actor: '0x6666666666666666666666666666666666666666' }),
+      (e: unknown) => e instanceof OperationStoreError && e.code === 'IDEMPOTENCY_KEY_CONFLICT'
+    );
+    // Different kind
+    assert.throws(
+      () => store.create({ ...NO_JOB_OP, kind: 'FUND_JOB' }),
+      (e: unknown) => e instanceof OperationStoreError && e.code === 'IDEMPOTENCY_KEY_CONFLICT'
+    );
+    // Different intentDigest
+    assert.throws(
+      () => store.create({ ...NO_JOB_OP, intentDigest: `0x${'cd'.repeat(32)}` }),
+      (e: unknown) => e instanceof OperationStoreError && e.code === 'IDEMPOTENCY_KEY_CONFLICT'
+    );
+    // Different nonce
+    assert.throws(
+      () => store.create({ ...NO_JOB_OP, nonce: 99 }),
+      (e: unknown) => e instanceof OperationStoreError && e.code === 'IDEMPOTENCY_KEY_CONFLICT'
+    );
+    // Different jobId
+    assert.throws(
+      () => store.create({ ...NO_JOB_OP, jobId: 42 }),
+      (e: unknown) => e instanceof OperationStoreError && e.code === 'IDEMPOTENCY_KEY_CONFLICT'
+    );
+  });
+
+  it('refuses to transition to FINALIZED without a recorded transaction hash', () => {
+    const store = new InMemoryOperationStore();
+    const r = store.create(NO_JOB_OP);
+    store.transition(r.id, 'SUBMITTED', { diagnostic: 'submitted without hash' });
+    assert.throws(
+      () => store.transition(r.id, 'FINALIZED'),
+      (e: unknown) => e instanceof OperationStoreError && e.code === 'TRANSACTION_HASH_REQUIRED'
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -501,6 +561,90 @@ describe('signer leases prevent a nonce being consumed twice', () => {
     assert.throws(() => store.claimSignerLease({ signer: ACTOR, nonce: 4, ttlSeconds: 60, holder: 'b' }));
     store.releaseSignerLease(lease.leaseId, 'a');
     assert.doesNotThrow(() => store.claimSignerLease({ signer: ACTOR, nonce: 4, ttlSeconds: 60, holder: 'b' }));
+  });
+
+  it('enforces signer lease contention and busy error on SqliteOperationStore', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'xyx-lease-'));
+    try {
+      const dbPath = path.join(dir, 'leases.sqlite');
+      const store = openOperationStore(dbPath);
+      store.claimSignerLease({ signer: ACTOR, nonce: 10, ttlSeconds: 30, holder: 'holder-1' });
+      assert.throws(
+        () => store.claimSignerLease({ signer: ACTOR, nonce: 10, ttlSeconds: 30, holder: 'holder-2' }),
+        (e: unknown) => e instanceof OperationStoreError && e.code === 'SIGNER_BUSY'
+      );
+      // Auto-nonce (null) contention
+      store.claimSignerLease({ signer: ACTOR, nonce: null, ttlSeconds: 30, holder: 'holder-1' });
+      assert.throws(
+        () => store.claimSignerLease({ signer: ACTOR, nonce: null, ttlSeconds: 30, holder: 'holder-2' }),
+        (e: unknown) => e instanceof OperationStoreError && e.code === 'SIGNER_BUSY'
+      );
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reclaims expired leases safely on SqliteOperationStore', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'xyx-lease-exp-'));
+    try {
+      const dbPath = path.join(dir, 'leases.sqlite');
+      const store = openOperationStore(dbPath);
+      store.claimSignerLease({ signer: ACTOR, nonce: 11, ttlSeconds: 1, holder: 'holder-1' });
+      const start = Date.now();
+      while (Date.now() - start < 1100) {
+        // wait for TTL to expire
+      }
+      assert.doesNotThrow(() =>
+        store.claimSignerLease({ signer: ACTOR, nonce: 11, ttlSeconds: 30, holder: 'holder-2' })
+      );
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('wrong holder cannot release another holder lease on SqliteOperationStore', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'xyx-lease-rel-'));
+    try {
+      const dbPath = path.join(dir, 'leases.sqlite');
+      const store = openOperationStore(dbPath);
+      const lease = store.claimSignerLease({ signer: ACTOR, nonce: 12, ttlSeconds: 60, holder: 'holder-1' });
+      store.releaseSignerLease(lease.leaseId, 'holder-2');
+      assert.throws(
+        () => store.claimSignerLease({ signer: ACTOR, nonce: 12, ttlSeconds: 60, holder: 'holder-2' }),
+        (e: unknown) => e instanceof OperationStoreError && e.code === 'SIGNER_BUSY'
+      );
+      store.releaseSignerLease(lease.leaseId, 'holder-1');
+      assert.doesNotThrow(() =>
+        store.claimSignerLease({ signer: ACTOR, nonce: 12, ttlSeconds: 60, holder: 'holder-2' })
+      );
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves active lease state across database restart', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'xyx-lease-restart-'));
+    try {
+      const dbPath = path.join(dir, 'leases.sqlite');
+      const store1 = openOperationStore(dbPath);
+      store1.claimSignerLease({ signer: ACTOR, nonce: 15, ttlSeconds: 60, holder: 'holder-1' });
+      store1.close();
+
+      const store2 = openOperationStore(dbPath);
+      assert.throws(
+        () => store2.claimSignerLease({ signer: ACTOR, nonce: 15, ttlSeconds: 60, holder: 'holder-2' }),
+        (e: unknown) => e instanceof OperationStoreError && e.code === 'SIGNER_BUSY'
+      );
+      assert.doesNotThrow(() =>
+        store2.claimSignerLease({ signer: ACTOR, nonce: 16, ttlSeconds: 60, holder: 'holder-2' })
+      );
+      store2.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -611,5 +755,400 @@ describe('the store is durable, and refuses not to be', () => {
     assert.equal(again.id, created.id);
     assert.equal(reopened.list().length, 1);
     reopened.close();
+  });
+
+  it('refuses conflicting idempotency key reuse across restarts', () => {
+    const file = path.join(directory, 'dup-conflict.sqlite');
+    const store = openOperationStore(file);
+    store.create({ ...NO_JOB_OP, idempotencyKey: 'op-key-0005' });
+    store.close();
+
+    const reopened = openOperationStore(file);
+    assert.throws(
+      () => reopened.create({ ...NO_JOB_OP, idempotencyKey: 'op-key-0005', kind: 'FUND_JOB' }),
+      (e: unknown) => e instanceof OperationStoreError && e.code === 'IDEMPOTENCY_KEY_CONFLICT'
+    );
+    reopened.close();
+  });
+
+  it('preserves operations in different statuses across restarts', () => {
+    const file = path.join(directory, 'statuses.sqlite');
+    const store = openOperationStore(file);
+
+    // Op in PREPARED
+    const opPrepared = store.create({ ...NO_JOB_OP, idempotencyKey: 'op-prep-0001' });
+
+    // Op in AMBIGUOUS
+    const opAmbiguous = store.create({ ...NO_JOB_OP, idempotencyKey: 'op-ambi-0001' });
+    store.transition(opAmbiguous.id, 'AMBIGUOUS', { diagnostic: 'broadcast lost' });
+
+    // Op in FINALIZED
+    const opFinal = store.create({ ...NO_JOB_OP, idempotencyKey: 'op-fin-0001' });
+    store.recordTransactionHash(opFinal.id, `0x${'88'.repeat(32)}`);
+    store.addObservation(opFinal.id, observation('primary', 'rpc-a'));
+    store.addObservation(opFinal.id, observation('secondary', 'rpc-b'));
+    store.reconcile(opFinal.id);
+    store.transition(opFinal.id, 'FINALIZED');
+
+    store.close();
+
+    const reopened = openOperationStore(file);
+    assert.equal(reopened.read(opPrepared.id)?.status, 'PREPARED');
+    assert.equal(reopened.read(opAmbiguous.id)?.status, 'AMBIGUOUS');
+    assert.equal(reopened.read(opFinal.id)?.status, 'FINALIZED');
+    // Cannot mutate FINALIZED across restarts
+    assert.throws(
+      () => reopened.transition(opFinal.id, 'FAILED'),
+      (e: unknown) => e instanceof OperationStoreError && e.code === 'OPERATION_ALREADY_FINALIZED'
+    );
+    reopened.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// API integration
+// ---------------------------------------------------------------------------
+
+describe('API routes enforce journal durability, input validation, and truthful lifecycle state', () => {
+  let directory: string;
+  let dbPath: string;
+
+  beforeEach(() => {
+    directory = mkdtempSync(path.join(tmpdir(), 'xyx-api-ops-'));
+    dbPath = path.join(directory, 'journal.sqlite');
+    resetOperationJournal();
+    delete process.env[OPERATIONS_DB_PATH_ENV];
+  });
+
+  afterEach(() => {
+    resetOperationJournal();
+    delete process.env[OPERATIONS_DB_PATH_ENV];
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  it('GET /api/operations returns durableJournalOpen: false when unconfigured', async () => {
+    const req = new Request('http://localhost/api/operations');
+    const res = await getOperationsRoute(req);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.durableJournalOpen, false);
+    assert.deepEqual(body.operations, []);
+  });
+
+  it('GET /api/operations validates query parameter limit', async () => {
+    process.env[OPERATIONS_DB_PATH_ENV] = dbPath;
+    const req = new Request('http://localhost/api/operations?limit=invalid');
+    const res = await getOperationsRoute(req);
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.error, 'OPERATIONS_LIMIT_INVALID');
+  });
+
+  it('POST /api/operations creates operation and GET /api/operations lists it', async () => {
+    process.env[OPERATIONS_DB_PATH_ENV] = dbPath;
+
+    const opInput = {
+      idempotencyKey: 'api-op-0001',
+      kind: 'PROPOSE_JOB',
+      actor: ACTOR,
+      actorRole: 'buyer',
+      expectedChainId: 10143,
+      deployment: DEPLOYMENT,
+      jobId: null,
+      intentDigest: `0x${'11'.repeat(32)}`,
+      nonce: 0,
+    };
+
+    const postReq = new Request('http://localhost/api/operations', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(opInput),
+    });
+    const postRes = await createOperationRoute(postReq);
+    assert.equal(postRes.status, 201);
+    const created = await postRes.json();
+    assert.equal(created.idempotencyKey, 'api-op-0001');
+    assert.equal(created.status, 'PREPARED');
+    assert.equal(created.actorAddress, ACTOR);
+    assert.equal(created.transactionHash, null);
+
+    // List operations
+    const listReq = new Request('http://localhost/api/operations');
+    const listRes = await getOperationsRoute(listReq);
+    assert.equal(listRes.status, 200);
+    const listBody = await listRes.json();
+    assert.equal(listBody.durableJournalOpen, true);
+    assert.equal(listBody.operations.length, 1);
+    assert.equal(listBody.operations[0].idempotencyKey, 'api-op-0001');
+  });
+
+  it('POST /api/operations is idempotent for identical inputs', async () => {
+    process.env[OPERATIONS_DB_PATH_ENV] = dbPath;
+    const opInput = {
+      idempotencyKey: 'api-op-0002',
+      kind: 'PROPOSE_JOB',
+      actor: ACTOR,
+      actorRole: 'buyer',
+      expectedChainId: 10143,
+      deployment: DEPLOYMENT,
+      intentDigest: `0x${'22'.repeat(32)}`,
+    };
+
+    const req1 = new Request('http://localhost/api/operations', {
+      method: 'POST',
+      body: JSON.stringify(opInput),
+    });
+    const res1 = await createOperationRoute(req1);
+    assert.equal(res1.status, 201);
+    const body1 = await res1.json();
+
+    const req2 = new Request('http://localhost/api/operations', {
+      method: 'POST',
+      body: JSON.stringify(opInput),
+    });
+    const res2 = await createOperationRoute(req2);
+    assert.equal(res2.status, 201);
+    const body2 = await res2.json();
+    assert.equal(body1.id, body2.id);
+  });
+
+  it('POST /api/operations rejects conflicting reuse of idempotency key with 409', async () => {
+    process.env[OPERATIONS_DB_PATH_ENV] = dbPath;
+    const opInput = {
+      idempotencyKey: 'api-op-0003',
+      kind: 'PROPOSE_JOB',
+      actor: ACTOR,
+      actorRole: 'buyer',
+      expectedChainId: 10143,
+      deployment: DEPLOYMENT,
+      intentDigest: `0x${'33'.repeat(32)}`,
+    };
+
+    const res1 = await createOperationRoute(new Request('http://localhost/api/operations', {
+      method: 'POST',
+      body: JSON.stringify(opInput),
+    }));
+    assert.equal(res1.status, 201);
+
+    // Conflicting reuse with different kind
+    const res2 = await createOperationRoute(new Request('http://localhost/api/operations', {
+      method: 'POST',
+      body: JSON.stringify({ ...opInput, kind: 'FUND_JOB' }),
+    }));
+    assert.equal(res2.status, 409);
+    const body2 = await res2.json();
+    assert.equal(body2.error, 'IDEMPOTENCY_KEY_CONFLICT');
+  });
+
+  it('POST /api/operations rejects secret-shaped fields with 400', async () => {
+    process.env[OPERATIONS_DB_PATH_ENV] = dbPath;
+    const res = await createOperationRoute(new Request('http://localhost/api/operations', {
+      method: 'POST',
+      body: JSON.stringify({
+        idempotencyKey: 'api-op-0004',
+        kind: 'PROPOSE_JOB',
+        actor: ACTOR,
+        actorRole: 'buyer',
+        expectedChainId: 10143,
+        deployment: DEPLOYMENT,
+        intentDigest: `0x${'44'.repeat(32)}`,
+        privateKey: '0x1234',
+      }),
+    }));
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.error, 'SECRET_SHAPED_INPUT_REJECTED');
+  });
+
+  it('POST /api/operations rejects unknown fields with 400', async () => {
+    process.env[OPERATIONS_DB_PATH_ENV] = dbPath;
+    const res = await createOperationRoute(new Request('http://localhost/api/operations', {
+      method: 'POST',
+      body: JSON.stringify({
+        idempotencyKey: 'api-op-0005',
+        kind: 'PROPOSE_JOB',
+        actor: ACTOR,
+        actorRole: 'buyer',
+        expectedChainId: 10143,
+        deployment: DEPLOYMENT,
+        intentDigest: `0x${'55'.repeat(32)}`,
+        unknownField: 'value',
+      }),
+    }));
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.error, 'UNKNOWN_FIELD_REJECTED');
+  });
+
+  it('GET and PATCH /api/operations/[id] report and update truthful lifecycle state', async () => {
+    process.env[OPERATIONS_DB_PATH_ENV] = dbPath;
+
+    // Create an operation
+    const opInput = {
+      idempotencyKey: 'api-op-0006',
+      kind: 'PROPOSE_JOB',
+      actor: ACTOR,
+      actorRole: 'buyer',
+      expectedChainId: 10143,
+      deployment: DEPLOYMENT,
+      intentDigest: `0x${'66'.repeat(32)}`,
+    };
+    const createRes = await createOperationRoute(new Request('http://localhost/api/operations', {
+      method: 'POST',
+      body: JSON.stringify(opInput),
+    }));
+    const created = await createRes.json();
+    const opId = created.id;
+    const capability = created.capabilityToken;
+    assert.ok(capability && capability.startsWith('opcap_'), 'POST /api/operations must issue a capabilityToken');
+
+    // GET without capability -> 401
+    const noCapRes = await getOperationByIdRoute(
+      new Request(`http://localhost/api/operations/${opId}`),
+      { params: Promise.resolve({ id: opId }) }
+    );
+    assert.equal(noCapRes.status, 401);
+
+    // GET with wrong capability -> 403
+    const wrongCapRes = await getOperationByIdRoute(
+      new Request(`http://localhost/api/operations/${opId}`, {
+        headers: { 'x-operation-capability': 'opcap_wrong1234567890' },
+      }),
+      { params: Promise.resolve({ id: opId }) }
+    );
+    assert.equal(wrongCapRes.status, 403);
+
+    // GET by id with valid capability
+    const getRes = await getOperationByIdRoute(
+      new Request(`http://localhost/api/operations/${opId}`, {
+        headers: { 'x-operation-capability': capability },
+      }),
+      { params: Promise.resolve({ id: opId }) }
+    );
+    assert.equal(getRes.status, 200);
+    const got = await getRes.json();
+    assert.equal(got.id, opId);
+    assert.equal(got.status, 'PREPARED');
+
+    // GET 404 for nonexistent id
+    const notFoundRes = await getOperationByIdRoute(
+      new Request('http://localhost/api/operations/nonexistent-id-12345'),
+      { params: Promise.resolve({ id: 'nonexistent-id-12345' }) }
+    );
+    assert.equal(notFoundRes.status, 404);
+
+    // GET 400 for invalid id (< 8 chars)
+    const invalidIdRes = await getOperationByIdRoute(
+      new Request('http://localhost/api/operations/short'),
+      { params: Promise.resolve({ id: 'short' }) }
+    );
+    assert.equal(invalidIdRes.status, 400);
+
+    // PATCH without capability -> 401
+    const noCapPatch = await updateOperationByIdRoute(
+      new Request(`http://localhost/api/operations/${opId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ action: 'RECORD_HASH', transactionHash: `0x${'77'.repeat(32)}` }),
+      }),
+      { params: Promise.resolve({ id: opId }) }
+    );
+    assert.equal(noCapPatch.status, 401);
+
+    // PATCH with wrong capability -> 403
+    const wrongCapPatch = await updateOperationByIdRoute(
+      new Request(`http://localhost/api/operations/${opId}`, {
+        method: 'PATCH',
+        headers: { 'x-operation-capability': 'opcap_badtoken1234' },
+        body: JSON.stringify({ action: 'RECORD_HASH', transactionHash: `0x${'77'.repeat(32)}` }),
+      }),
+      { params: Promise.resolve({ id: opId }) }
+    );
+    assert.equal(wrongCapPatch.status, 403);
+
+    // PATCH record transaction hash
+    const txHash = `0x${'77'.repeat(32)}`;
+    const patchHashRes = await updateOperationByIdRoute(
+      new Request(`http://localhost/api/operations/${opId}`, {
+        method: 'PATCH',
+        headers: { 'x-operation-capability': capability },
+        body: JSON.stringify({ action: 'RECORD_HASH', transactionHash: txHash }),
+      }),
+      { params: Promise.resolve({ id: opId }) }
+    );
+    assert.equal(patchHashRes.status, 200);
+    const hashed = await patchHashRes.json();
+    assert.equal(hashed.status, 'SUBMITTED');
+    assert.equal(hashed.transactionHash, txHash);
+
+    // PATCH add observations
+    const obsPrimary = observation('primary', 'rpc-alpha');
+    const patchObs1Res = await updateOperationByIdRoute(
+      new Request(`http://localhost/api/operations/${opId}`, {
+        method: 'PATCH',
+        headers: { 'x-operation-capability': capability },
+        body: JSON.stringify({ action: 'ADD_OBSERVATION', observation: obsPrimary }),
+      }),
+      { params: Promise.resolve({ id: opId }) }
+    );
+    assert.equal(patchObs1Res.status, 200);
+
+    const obsSecondary = observation('secondary', 'rpc-beta');
+    const patchObs2Res = await updateOperationByIdRoute(
+      new Request(`http://localhost/api/operations/${opId}`, {
+        method: 'PATCH',
+        headers: { 'x-operation-capability': capability },
+        body: JSON.stringify({ action: 'ADD_OBSERVATION', observation: obsSecondary }),
+      }),
+      { params: Promise.resolve({ id: opId }) }
+    );
+    assert.equal(patchObs2Res.status, 200);
+
+    // PATCH reconcile
+    const patchReconcileRes = await updateOperationByIdRoute(
+      new Request(`http://localhost/api/operations/${opId}`, {
+        method: 'PATCH',
+        headers: { 'x-operation-capability': capability },
+        body: JSON.stringify({ action: 'RECONCILE' }),
+      }),
+      { params: Promise.resolve({ id: opId }) }
+    );
+    assert.equal(patchReconcileRes.status, 200);
+    const reconciled = await patchReconcileRes.json();
+    assert.equal(reconciled.reconciliation, 'AGREED');
+
+    // PATCH transition to FINALIZED
+    const patchFinalRes = await updateOperationByIdRoute(
+      new Request(`http://localhost/api/operations/${opId}`, {
+        method: 'PATCH',
+        headers: { 'x-operation-capability': capability },
+        body: JSON.stringify({ action: 'TRANSITION', to: 'FINALIZED' }),
+      }),
+      { params: Promise.resolve({ id: opId }) }
+    );
+    assert.equal(patchFinalRes.status, 200);
+    const finalized = await patchFinalRes.json();
+    assert.equal(finalized.status, 'FINALIZED');
+
+    // Reject secret in PATCH
+    const secretPatchRes = await updateOperationByIdRoute(
+      new Request(`http://localhost/api/operations/${opId}`, {
+        method: 'PATCH',
+        headers: { 'x-operation-capability': capability },
+        body: JSON.stringify({ action: 'RECONCILE', privateKey: '0x1234' }),
+      }),
+      { params: Promise.resolve({ id: opId }) }
+    );
+    assert.equal(secretPatchRes.status, 400);
+
+    // Reject downgrade from FINALIZED
+    const downgradeRes = await updateOperationByIdRoute(
+      new Request(`http://localhost/api/operations/${opId}`, {
+        method: 'PATCH',
+        headers: { 'x-operation-capability': capability },
+        body: JSON.stringify({ action: 'TRANSITION', to: 'FAILED' }),
+      }),
+      { params: Promise.resolve({ id: opId }) }
+    );
+    assert.equal(downgradeRes.status, 400);
   });
 });

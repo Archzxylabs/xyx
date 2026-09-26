@@ -244,3 +244,188 @@ test('the delivery commitment itself is not the plaintext', async () => {
   assert.match(evidence.deliveryCommitment, /^0x[0-9a-f]{64}$/);
   assertClean(evidence, 'RunEvidence commitment');
 });
+
+/**
+ * Walk every reachable string rather than only the enumerable JSON surface.
+ *
+ * `JSON.stringify` is not enough for this file's central claim. Error
+ * `message`, `name`, and `code` are non-enumerable, so stringifying an Error
+ * straight produces `{}` and every leak check silently passes. A privacy test
+ * written that way would go green while the runner interpolated the wallet's
+ * reason into a public error message — the exact defect this guards.
+ */
+function collectText(value: unknown, out: string[] = [], depth = 0): string[] {
+  if (depth > 8 || value === null || value === undefined) return out;
+  if (typeof value === 'string') { out.push(value); return out; }
+  if (typeof value === 'bigint' || typeof value === 'number' || typeof value === 'boolean') {
+    out.push(value.toString());
+    return out;
+  }
+  if (value instanceof Error) {
+    out.push(value.message, value.name);
+    const code = (value as { code?: unknown }).code;
+    if (typeof code === 'string') out.push(code);
+    const own: Record<string, unknown> = {};
+    for (const key of Object.getOwnPropertyNames(value)) {
+      if (key === 'stack') continue;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor && 'value' in descriptor) own[key] = descriptor.value;
+    }
+    collectText(own, out, depth + 1);
+    return out;
+  }
+  if (typeof value === 'object') {
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      out.push(key);
+      collectText(entry, out, depth + 1);
+    }
+    return out;
+  }
+  out.push(String(value));
+  return out;
+}
+
+/** Assert every literal marker and the salt are absent from a whole surface. */
+function assertCleanDeep(recorded: unknown, label: string): void {
+  const text = collectText(recorded).join('\u0000');
+  for (const secret of FORBIDDEN) {
+    assert.ok(!text.includes(secret), `${label} leaked ${secret}: ${text.slice(0, 300)}`);
+  }
+  assert.ok(!text.includes(SALT), `${label} leaked the delivery salt: ${text.slice(0, 300)}`);
+}
+
+// A distinctive remote address and authorization header value, because a test
+// that searched only for the plaintext would miss a leak whose worst part is
+// the credential the wallet echoed back.
+const SIGNER_MARKER_URL = 'https://marker.example.invalid/leak-me';
+const SIGNER_MARKER_BEARER = 'bearer-MARKER-TOKEN-REVOKE-ME';
+const SIGNER_MARKER_PLAINTEXT = 'EXECUTOR-SECRET-not-for-output';
+
+test('a signer that refuses does not put its reason into RunStep or RunEvidence', async () => {
+  jobState = fundedJob();
+  receiptFor = `0x${'5b'.repeat(32)}`;
+  const bothReaders = reader();
+  const runner = new ProviderRunner({
+    ...BASE_CONFIG,
+    primary: bothReaders,
+    secondary: bothReaders,
+    paymentToken: TOKEN as Address,
+    transfer: { requirement, execute: async () => `0x${'5b'.repeat(32)}` as Hex },
+    // A wallet that quotes the job's own contents and an authorization header
+    // back out of its error dialog. Nothing here may survive into public output.
+    signer: {
+      address: PROVIDER as Address,
+      sendTransaction: async () => ({
+        kind: 'rejected' as const,
+        reason: `wallet refused ${SIGNER_MARKER_URL} after seeing ${SIGNER_MARKER_PLAINTEXT} for ${SIGNER_MARKER_BEARER}`,
+      }),
+    },
+  } as never);
+
+  const { evidence } = await runner.run();
+  assert.equal(evidence.status, 'FAILED');
+  assert.equal(evidence.failure?.code, 'SEND_FAILED');
+  // The code is stable and runner-authored. The step log is public output too:
+  // a detail that quoted the wallet would be forwarded by the same integrator.
+  assertCleanDeep(evidence.failure, 'RunEvidence.failure from a signer refusal');
+  assertCleanDeep(evidence.steps, 'RunEvidence.steps from a signer refusal');
+});
+
+test('a collaborator error cause and header do not reach any Error field', async () => {
+  // Old behavior: only Error.message was scrubbed, so a cause, a code, or a
+  // nested reason still carried the collaborator's URL and header into whatever
+  // the integrator logged. JSON.stringify(error) hides those fields, so this
+  // walks them explicitly. The thrown Error is constructed here, not by a runner
+  // helper.
+  jobState = fundedJob();
+  const nested = new Error('https://privacy-marker.example.invalid/raw');
+  (nested as Error & { code?: string }).code = 'authorization: PRIVACY-HEADER-MARKER';
+  const runner = new ProviderRunner({
+    ...BASE_CONFIG,
+    executor: {
+      execute: async () => {
+        throw Object.assign(nested, { reason: SECRET_PLAINTEXT.note, salt: SALT });
+      },
+    },
+    primary: reader(),
+    secondary: reader(),
+    paymentToken: TOKEN as Address,
+    transfer: { requirement, observedTransactionHash: `0x${'5d'.repeat(32)}` as Hex },
+  } as never);
+
+  let thrown: unknown;
+  try {
+    await runner.prepare();
+  } catch (error) {
+    thrown = error;
+  }
+  assert.ok(thrown instanceof RunnerError);
+  assert.equal(thrown.code, 'EXECUTION_FAILED');
+  assert.equal(thrown.name, 'RunnerError');
+  assert.equal((thrown as { cause?: unknown }).cause, undefined);
+  assertCleanDeep(thrown, 'RunnerError including cause and code');
+  const walked = collectText(thrown).join('\u0000');
+  assert.ok(!walked.includes('privacy-marker.example.invalid'));
+  assert.ok(!walked.includes('PRIVACY-HEADER-MARKER'));
+  assert.ok(!walked.includes('authorization'));
+  assert.ok(!walked.includes(SALT));
+
+  // Legitimate control: the same readers and a successful executor still transfer.
+  const hash = `0x${'5e'.repeat(32)}`;
+  receiptFor = hash;
+  const control = new ProviderRunner({
+    ...BASE_CONFIG,
+    primary: reader(),
+    secondary: reader(),
+    paymentToken: TOKEN as Address,
+    transfer: { requirement, observedTransactionHash: hash as Hex },
+  } as never);
+  const { evidence, prepared } = await control.prepare();
+  assert.equal(evidence.status, 'TRANSFERRED');
+  assert.equal(evidence.failure, undefined);
+  assert.equal(evidence.transfer?.transactionHash, hash);
+  assert.equal(prepared?.request.functionName, 'submitDelivery');
+  assert.match(prepared?.commitment ?? '', /^0x[0-9a-f]{64}$/);
+  assertCleanDeep(evidence, 'legitimate RunEvidence');
+  for (const step of evidence.steps) assertCleanDeep(step, `legitimate step ${step.status}`);
+});
+
+test('an executor failure reason does not reach RunnerError or RunEvidence', async () => {
+  jobState = fundedJob();
+  // Make the executor fail with text that carries every marker class, so a
+  // leak of any one of them is caught rather than only the obvious plaintext.
+  const failingExecutor = new ProviderRunner({
+    ...BASE_CONFIG,
+    privateInput: {
+      provide: async () => ({
+        schema: 'xyx.delivery',
+        kind: 'analysis',
+        content: { terms: SECRET_PLAINTEXT.term, credential: SECRET_PLAINTEXT.credential },
+        salt: SALT as Hex,
+      }),
+    },
+    executor: {
+      execute: async () => ({
+        ok: false as const,
+        reason: `task failed: ${SECRET_PLAINTEXT.note} at ${SIGNER_MARKER_URL} for ${SIGNER_MARKER_BEARER}`,
+      }),
+    },
+    primary: reader(),
+    secondary: reader(),
+    paymentToken: TOKEN as Address,
+    transfer: { requirement, execute: async () => `0x${'5c'.repeat(32)}` as Hex },
+  } as never);
+
+  let evidence: Awaited<ReturnType<typeof failingExecutor.run>>['evidence'] | undefined;
+  let thrown: unknown;
+  try {
+    ({ evidence } = await failingExecutor.prepare());
+  } catch (error) {
+    thrown = error;
+  }
+
+  assert.ok(thrown instanceof RunnerError, 'an executor failure must fail the run closed');
+  assert.equal((thrown as RunnerError).code, 'EXECUTION_FAILED');
+  assertCleanDeep(thrown, 'RunnerError from an executor failure');
+  if (evidence !== undefined) assertCleanDeep(evidence, 'RunEvidence from an executor failure');
+});

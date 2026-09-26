@@ -228,6 +228,7 @@ export type OperationFailureCode =
   | 'OPERATION_SCHEMA_UNSUPPORTED'
   | 'OPERATION_ID_INVALID'
   | 'IDEMPOTENCY_KEY_REQUIRED'
+  | 'IDEMPOTENCY_KEY_CONFLICT'
   | 'OPERATION_KIND_INVALID'
   | 'ACTOR_ADDRESS_INVALID'
   | 'ACTOR_ROLE_INVALID'
@@ -595,6 +596,7 @@ export const SECRET_FIELD_NAMES: readonly string[] = [
   'rawtransaction',
   'rawtx',
   'transactionpayload',
+  'signedpayload',
   'passkey',
   'webauthn',
   'authenticatordata',
@@ -604,6 +606,11 @@ export const SECRET_FIELD_NAMES: readonly string[] = [
   'prf',
   'privatematerial',
   'privatekeyhex',
+  'privateterm',
+  'privateterms',
+  'rawprivateterms',
+  'rawterms',
+  'rawprivateevidence',
   'apitoken',
   'accesstoken',
   'bearertoken',

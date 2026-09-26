@@ -95,5 +95,11 @@ export function isOperationJournalOpen(): boolean {
   return cached !== null;
 }
 
+/** True when the operations journal storage path is configured and valid. */
+export function isOperationJournalConfigured(): boolean {
+  const configured = process.env[OPERATIONS_DB_PATH_ENV];
+  return typeof configured === 'string' && configured.trim() !== '' && configured.trim() !== ':memory:';
+}
+
 /** Re-exported so a route can distinguish a config failure from a data failure. */
 export { OperationStoreError };
