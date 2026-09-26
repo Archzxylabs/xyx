@@ -14,6 +14,7 @@
     "build:contracts": "forge build --root packages/contracts",
     "dev:web": "node scripts/web-entry.mjs dev apps/web",
     "build:web": "node scripts/web-entry.mjs build apps/web",
+    "vercel-build": "npm run build:web",
     "demo": "echo 'LEGACY_SCRIPT_RETIRED: use canonical XYXDeliveryProtocol flow'",
     "publish:manifest": "echo 'LEGACY_SCRIPT_RETIRED: use canonical XYXDeliveryProtocol flow'",
     "claim:refund": "node --env-file=.env --import tsx scripts/claim-refund.ts",
